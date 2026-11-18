@@ -25,20 +25,9 @@
 - **点哪回哪**：点击任务直接跳回对应应用或会话（Codex、千问、Antigravity 等支持直达会话；CLI 会话支持一键复制恢复命令）。待确认或已完成任务跳转后自动标为已读并淡出，也可右键手动标为已读。
 - **历史对话随时找**：支持在浮窗内切换「当前 / 历史」，按最近更新时间倒序展示，随时回溯过往会话。
 
-<div align="center">
-<table>
-  <tr>
-    <td align="center" width="38%">
-      <img src="docs/previews/mascot-panel.png" alt="工头喵全局任务浮窗" width="280" />
-      <br /><sub><b>全局任务浮窗</b> · 三态任务一目了然</sub>
-    </td>
-    <td align="center" width="62%">
-      <img src="docs/previews/integrations.png" alt="兼容与接入管理" width="460" />
-      <br /><sub><b>兼容与接入</b> · 一键检测、接入与清理</sub>
-    </td>
-  </tr>
-</table>
-</div>
+<p>
+  <img src="docs/previews/mascot-panel.png" alt="工头喵全局任务浮窗" width="360" />
+</p>
 
 ---
 
@@ -86,6 +75,10 @@
 
 > 首次打开会自动检测并接入本机已安装的客户端；后续新装了其他 AI 工具，只需在「兼容与接入」点一次 **「接入已安装客户端」**。如需卸载清理，点击 **「移除接入配置」** 即可无痕还原。  
 > 详细版本适配情况可查看 [兼容矩阵与验证记录](docs/兼容矩阵-20261118.md)。
+
+<p>
+  <img src="docs/previews/integrations.png" alt="兼容与接入管理" width="680" />
+</p>
 
 ---
 
