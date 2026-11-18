@@ -70,6 +70,7 @@ class MonitorTests(unittest.TestCase):
             monitor = m.Monitor(root / 'data', db)
             monitor.tick()
             self.assertFalse(monitor.entries, 'Read completions must stay hidden at startup')
+            self.assertEqual(monitor.history[0]['id'], 'thread', 'Read conversations remain available in history')
             with sqlite3.connect(db) as connection:
                 connection.execute("UPDATE thread_read_receipts SET first_unread_turn='turn-1'")
             monitor.tick()
@@ -124,6 +125,25 @@ class MonitorTests(unittest.TestCase):
                 connection.execute('DELETE FROM thread_read_receipts')
             restarted.tick()
             self.assertNotIn('thread', restarted.entries, 'History without unread receipts must stay hidden')
+
+    def test_history_uses_database_updates_even_without_journals(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            db = root / 'state.sqlite'
+            with sqlite3.connect(db) as connection:
+                connection.execute('CREATE TABLE threads (id,title,name,cwd,rollout_path,archived,thread_source,attached_thread_parent_id,updated_at,updated_at_ms)')
+                for index in range(12):
+                    connection.execute('INSERT INTO threads VALUES (?,?,?,?,?,0,?,NULL,?,?)',
+                                       (str(index), f'对话 {index}', '', '/project', str(root / 'missing'), 'user', 1000 + index, None))
+            monitor = m.Monitor(root / 'data', db)
+            monitor.tick(publish=False)
+            self.assertFalse(monitor.entries)
+            self.assertEqual(len(monitor.history), 12)
+            self.assertEqual(max(monitor.history, key=lambda entry: entry['updated'])['id'], '11')
+            with sqlite3.connect(db) as connection:
+                connection.execute("UPDATE threads SET updated_at_ms=2000000 WHERE id='0'")
+            monitor.tick(publish=False)
+            self.assertEqual(max(monitor.history, key=lambda entry: entry['updated'])['id'], '0')
 
     def test_large_turn_is_found_beyond_tail(self):
         with tempfile.TemporaryDirectory() as root:

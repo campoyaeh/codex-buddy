@@ -9,7 +9,7 @@ import sqlite3
 import time
 
 HOME = Path.home() / '.codex'
-DATA = HOME / 'task-manager'
+DATA = Path(os.environ.get('TASK_PANEL_DATA_DIR', str(HOME / 'task-manager')))
 TERMINAL = {'task_complete', 'turn_aborted'}
 
 
@@ -137,19 +137,28 @@ class Monitor:
         data.mkdir(parents=True, exist_ok=True)
         self.database = database
         self.entries = {}
+        self.history = []
         self.cache = {}
         self.states = {}
         self.dismissed = read_json(data / 'dismissed.json', {})
         self.last_output = None
 
-    def tick(self):
+    def tick(self, publish=True):
         self.dismissed = read_json(self.data / 'dismissed.json', self.dismissed)
         with sqlite3.connect(f'file:{self.database}?mode=ro', uri=True, timeout=2) as connection:
             has_receipts = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_read_receipts'").fetchone()
             receipts = dict(connection.execute('SELECT thread_id, first_unread_turn FROM thread_read_receipts')) if has_receipts else {}
-            rows = connection.execute("SELECT id, COALESCE(NULLIF(name,''),title), cwd, rollout_path FROM threads WHERE archived=0 AND thread_source IN ('user','automation','agent_created_thread') AND attached_thread_parent_id IS NULL").fetchall()
+            columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
+            updated = 'updated_at * 1000' if 'updated_at' in columns else '0'
+            if 'updated_at_ms' in columns:
+                updated = f'COALESCE(updated_at_ms, {updated})'
+            rows = connection.execute(f"SELECT {updated}, id, COALESCE(NULLIF(name,''),title), cwd, rollout_path FROM threads WHERE archived=0 AND thread_source IN ('user','automation','agent_created_thread') AND attached_thread_parent_id IS NULL").fetchall()
+        self.history = [dict(id=thread, title=' '.join((title or 'Codex 对话').split()),
+                             project=Path(cwd or '').name, updated=(updated or 0) / 1000,
+                             turn='', status='stopped')
+                        for updated, thread, title, cwd, filename in rows]
         present = set()
-        for thread, title, cwd, filename in rows:
+        for updated, thread, title, cwd, filename in rows:
             present.add(thread)
             path = Path(filename)
             try:
@@ -187,6 +196,9 @@ class Monitor:
             self.cache[thread] = {'signature': signature, 'inode': stat.st_ino, 'offset': offset}
             self.states[thread] = task
         self.states = {key: task for key, task in self.states.items() if key in present}
+        for entry in self.history:
+            state = self.states.get(entry['id'], {})
+            entry.update(turn=state.get('turn', ''), status=state.get('status', 'stopped'))
         self.entries = {}
         for thread, task in self.states.items():
             status = task.get('status')
@@ -202,8 +214,10 @@ class Monitor:
             elif status not in {'running', 'waiting'}:
                 continue
             self.entries[thread] = task
-        priority = {'waiting': 0, 'running': 1, 'completed': 2}
+        priority = {'waiting': 0, 'completed': 1, 'running': 2}
         ordered = sorted(self.entries.values(), key=lambda t: (priority.get(t['status'], 4), t['title']))
+        if not publish:
+            return ordered
         tasks = [{key: task.get(key, '') for key in ('id', 'turn', 'title', 'status')} for task in ordered]
         encoded = json.dumps(tasks, ensure_ascii=False, sort_keys=True)
         if encoded != self.last_output:
@@ -226,12 +240,13 @@ def main():
         fcntl.flock(collector_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return
-    monitor = Monitor()
+    from providers import UnifiedMonitor
+    monitor = UnifiedMonitor(DATA, codex=Monitor())
     while not args.parent or os.getppid() == args.parent:
         try:
             monitor.tick()
         except Exception as error:
-            atomic_json(DATA / 'snapshot.json', {'tasks': list(monitor.entries.values()), 'error': str(error), 'updated': time.time()})
+            atomic_json(DATA / 'snapshot.json', {'tasks': list(monitor.entries.values()), 'history': monitor.history, 'error': str(error), 'updated': time.time()})
             monitor.last_output = None
         if args.once:
             break

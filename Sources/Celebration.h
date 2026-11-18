@@ -1,9 +1,13 @@
 // Native, click-through completion artwork and user-configurable presentation.
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import "Mascot.h"
 
 FOUNDATION_EXPORT const CGFloat CelebrationArtworkCornerRadius;
+FOUNDATION_EXPORT const NSInteger CelebrationRandomStyle;
 FOUNDATION_EXPORT NSArray<NSString *> *CelebrationStyleTitles(void);
+FOUNDATION_EXPORT NSInteger CelebrationPlaybackStyle(NSInteger selection, NSInteger previous);
+FOUNDATION_EXPORT NSRect CelebrationOverlayFrame(NSRect visibleFrame);
 FOUNDATION_EXPORT NSArray<NSString *> *CelebrationMessages(void);
 FOUNDATION_EXPORT NSString *CelebrationRandomMessage(NSString *previous);
 
@@ -16,6 +20,7 @@ FOUNDATION_EXPORT NSString *CelebrationRandomMessage(NSString *previous);
 @property BOOL reducedMotion;
 @property BOOL stillFrame;
 @property(copy) NSString *message;
+@property(copy) NSString *mascotID;
 @end
 
 @interface CelebrationController : NSObject <NSWindowDelegate>
@@ -30,6 +35,11 @@ FOUNDATION_EXPORT NSString *CelebrationRandomMessage(NSString *previous);
 @property(copy) void (^settingDidChange)(NSString *key);
 @property(strong) NSTextField *durationLabel;
 @property(strong) NSTextField *saveStatus;
+@property(strong) NSTextField *mascotDescription;
+- (void)changeMascot:(MascotChoiceButton *)sender;
+- (void)changeTheme:(id)sender;
+- (void)applyTheme;
+- (void)buildSettings;
 - (instancetype)initWithDirectory:(NSString *)directory;
 - (void)showOnScreen:(NSScreen *)screen;
 - (void)stop;
