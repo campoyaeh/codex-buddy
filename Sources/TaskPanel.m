@@ -122,6 +122,114 @@ static PanelSurface *StatusDot(NSString *status, NSRect frame) {
     dot.toolTip = [status isEqual:@"waiting"] ? @"待输入" : ([status isEqual:@"completed"] ? @"已完成" : @"进行中");
     return dot;
 }
+static void ApplyWaitingDotAnimation(PanelSurface *dot, NSAppearance *appearance) {
+    if (NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion) return;
+    dot.wantsLayer = YES;
+    dot.layer.masksToBounds = NO;
+    dot.fillColor = NSColor.clearColor;
+    CGFloat diameter = MIN(NSWidth(dot.bounds), NSHeight(dot.bounds));
+    CGPoint center = CGPointMake(NSMidX(dot.bounds), NSMidY(dot.bounds));
+    CGRect circle = CGRectMake(0, 0, diameter, diameter);
+    NSColor *waitingColor = StatusColor(@"waiting");
+    NSColor *amberColor = PanelColor(0xf5a623, 0xffd60a, 1.0);
+    CFTimeInterval duration = 1.8;
+    CFTimeInterval phase = fmod(CACurrentMediaTime(), duration);
+
+    CALayer *halo = [CALayer layer];
+    halo.bounds = circle;
+    halo.position = center;
+    halo.anchorPoint = CGPointMake(0.5, 0.5);
+    halo.cornerRadius = diameter / 2;
+    halo.opacity = 0;
+
+    CALayer *core = [CALayer layer];
+    core.bounds = circle;
+    core.position = center;
+    core.anchorPoint = CGPointMake(0.5, 0.5);
+    core.cornerRadius = diameter / 2;
+    core.shadowOffset = CGSizeZero;
+    core.shadowRadius = 4.0;
+    core.shadowOpacity = 0.65;
+
+    [(appearance ?: dot.effectiveAppearance) performAsCurrentDrawingAppearance:^{
+        halo.backgroundColor = amberColor.CGColor;
+        core.backgroundColor = waitingColor.CGColor;
+        core.shadowColor = amberColor.CGColor;
+    }];
+
+    CABasicAnimation *haloScale = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    haloScale.fromValue = @1.0;
+    haloScale.toValue = @2.45;
+    CABasicAnimation *haloOpacity = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    haloOpacity.fromValue = @0.65;
+    haloOpacity.toValue = @0.0;
+    CAAnimationGroup *haloGroup = [CAAnimationGroup animation];
+    haloGroup.animations = @[haloScale, haloOpacity];
+    haloGroup.duration = duration;
+    haloGroup.repeatCount = HUGE_VALF;
+    haloGroup.removedOnCompletion = NO;
+    haloGroup.timeOffset = phase;
+    haloGroup.timingFunction = [CAMediaTimingFunction functionWithControlPoints:0.22f :1.0f :0.36f :1.0f];
+    [halo addAnimation:haloGroup forKey:@"waitingHalo"];
+    [dot.layer addSublayer:halo];
+
+    CAMediaTimingFunction *ease = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    CAKeyframeAnimation *coreOpacity = [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+    coreOpacity.values = @[@1.0, @0.48, @1.0];
+    coreOpacity.keyTimes = @[@0.0, @0.5, @1.0];
+    coreOpacity.timingFunctions = @[ease, ease];
+    CAKeyframeAnimation *coreScale = [CAKeyframeAnimation animationWithKeyPath:@"transform.scale"];
+    coreScale.values = @[@1.0, @1.14, @1.0];
+    coreScale.keyTimes = @[@0.0, @0.5, @1.0];
+    coreScale.timingFunctions = @[ease, ease];
+    CAKeyframeAnimation *coreGlowRadius = [CAKeyframeAnimation animationWithKeyPath:@"shadowRadius"];
+    coreGlowRadius.values = @[@2.0, @6.5, @2.0];
+    coreGlowRadius.keyTimes = @[@0.0, @0.5, @1.0];
+    coreGlowRadius.timingFunctions = @[ease, ease];
+    CAKeyframeAnimation *coreGlowOpacity = [CAKeyframeAnimation animationWithKeyPath:@"shadowOpacity"];
+    coreGlowOpacity.values = @[@0.25, @0.9, @0.25];
+    coreGlowOpacity.keyTimes = @[@0.0, @0.5, @1.0];
+    coreGlowOpacity.timingFunctions = @[ease, ease];
+    CAAnimationGroup *coreGroup = [CAAnimationGroup animation];
+    coreGroup.animations = @[coreOpacity, coreScale, coreGlowRadius, coreGlowOpacity];
+    coreGroup.duration = duration;
+    coreGroup.repeatCount = HUGE_VALF;
+    coreGroup.removedOnCompletion = NO;
+    coreGroup.timeOffset = phase;
+    [core addAnimation:coreGroup forKey:@"waitingPulse"];
+    [dot.layer addSublayer:core];
+}
+static void ApplyWaitingRowAnimation(PanelSurface *row, NSAppearance *appearance) {
+    NSColor *amber = PanelColor(0xe5a000, 0xffd60a, 1.0);
+    row.fillColor = [amber colorWithAlphaComponent:0.08];
+    row.outlineColor = [amber colorWithAlphaComponent:0.28];
+    row.layer.borderWidth = 0.75;
+    if (NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion) return;
+    CFTimeInterval duration = 1.8;
+    CFTimeInterval phase = fmod(CACurrentMediaTime(), duration);
+    CAMediaTimingFunction *ease = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    [(appearance ?: row.effectiveAppearance) performAsCurrentDrawingAppearance:^{
+        id lowBg = (id)[amber colorWithAlphaComponent:0.05].CGColor;
+        id highBg = (id)[amber colorWithAlphaComponent:0.155].CGColor;
+        id lowBorder = (id)[amber colorWithAlphaComponent:0.14].CGColor;
+        id highBorder = (id)[amber colorWithAlphaComponent:0.52].CGColor;
+        CAKeyframeAnimation *bgPulse = [CAKeyframeAnimation animationWithKeyPath:@"backgroundColor"];
+        bgPulse.values = @[lowBg, highBg, lowBg];
+        bgPulse.keyTimes = @[@0.0, @0.5, @1.0];
+        bgPulse.timingFunctions = @[ease, ease];
+        CAKeyframeAnimation *borderPulse = [CAKeyframeAnimation animationWithKeyPath:@"borderColor"];
+        borderPulse.values = @[lowBorder, highBorder, lowBorder];
+        borderPulse.keyTimes = @[@0.0, @0.5, @1.0];
+        borderPulse.timingFunctions = @[ease, ease];
+        CAAnimationGroup *rowGroup = [CAAnimationGroup animation];
+        rowGroup.animations = @[bgPulse, borderPulse];
+        rowGroup.duration = duration;
+        rowGroup.repeatCount = HUGE_VALF;
+        rowGroup.removedOnCompletion = NO;
+        rowGroup.timeOffset = phase;
+        [row.layer addAnimation:rowGroup forKey:@"waitingRowPulse"];
+    }];
+}
 static NSImage *SourceIcon(NSDictionary *task) {
     static NSCache<NSString *, NSImage *> *cache;
     if (!cache) cache = [NSCache new];
@@ -857,6 +965,9 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         PanelSurface *dot = StatusDot(summaryStatus, NSMakeRect(33,7,6,6));
         if (!self.tasks.count) dot.fillColor = NSColor.tertiaryLabelColor;
         [root addSubview:dot];
+        if (self.tasks.count && [summaryStatus isEqual:@"waiting"]) {
+            ApplyWaitingDotAnimation(dot, self.panel.effectiveAppearance);
+        }
     }
     TaskButton *collapse = [TaskButton buttonWithTitle:self.collapsed ? @"展开" : @"收起" target:self action:@selector(toggleCollapsed:)];
     collapse.bordered = NO;
@@ -937,12 +1048,18 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         }
         row.menu = rowMenu;
         [document addSubview:row];
+        if (!self.showingHistory && needsInput) {
+            ApplyWaitingRowAnimation(row, self.panel.effectiveAppearance);
+        }
         PanelSurface *state = StatusDot(task[@"status"], NSMakeRect(11,13.5,7,7));
         if (self.showingHistory) {
             state.fillColor = NSColor.tertiaryLabelColor;
             state.toolTip = @"历史对话";
         }
         [row addSubview:state];
+        if (!self.showingHistory && needsInput) {
+            ApplyWaitingDotAnimation(state, self.panel.effectiveAppearance);
+        }
         TaskButton *open = [TaskButton buttonWithTitle:task[@"title"] ?: @"Codex 任务" target:self action:@selector(openTask:)];
         open.threadID = task[@"id"];
         open.bordered = NO;
