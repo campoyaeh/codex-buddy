@@ -462,6 +462,57 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(set(monitor.entries), {'opencode:v1', 'opencode:v2'})
         self.assertTrue(all(t['status'] == 'completed' for t in monitor.entries.values()))
 
+    def test_antigravity_uppercase_cancel_and_error_stop_cleanly(self):
+        for reason in ('USER_CANCELED', 'ERROR', 'MAX_INVOCATIONS'):
+            cid = 'ag-' + reason.lower()
+            bridge.receive('antigravity', 'PreInvocation', {'conversationId': cid, 'lastUserInput': '测试'}, self.data)
+            stopped = bridge.receive('antigravity', 'Stop', {'conversationId': cid, 'terminationReason': reason}, self.data)
+            self.assertEqual(stopped['status'], 'stopped')
+        monitor = self.monitor()
+        self.assertEqual(monitor.entries, {})
+
+    def test_antigravity_post_tool_use_uses_matcher_group(self):
+        merged = setup.merge_config({}, 'antigravity', 'antigravity', ['PreInvocation', 'PostToolUse', 'Stop'], '/b/task_bridge.py', self.data)
+        self.assertEqual(merged['ai-task-monitor']['PostToolUse'][0]['matcher'], '*')
+        self.assertTrue(isinstance(merged['ai-task-monitor']['PostToolUse'][0]['hooks'], list))
+        self.assertEqual(merged['ai-task-monitor']['PreInvocation'][0]['type'], 'command')
+        self.assertEqual(merged, setup.merge_config(merged, 'antigravity', 'antigravity', ['PreInvocation', 'PostToolUse', 'Stop'], '/b/task_bridge.py', self.data))
+
+    def test_antigravity_idle_or_killed_summary_reconciles_stuck_running_task(self):
+        database = self.home / '.gemini/antigravity/conversation_summaries.db'
+        database.parent.mkdir(parents=True)
+        now = p.time.time()
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "CREATE TABLE conversation_summaries "
+                "(conversation_id TEXT, parent_conversation_id TEXT, status TEXT, not_fully_idle INTEGER, killed INTEGER, last_modified_time TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO conversation_summaries VALUES (?,?,?,?,?,?)",
+                [
+                    ('stuck-idle', '', 'CASCADE_RUN_STATUS_IDLE', 0, 0, '2026-11-19 03:56:54.94332+00:00'),
+                    ('stuck-killed', '', 'CASCADE_RUN_STATUS_RUNNING', 1, 1, '2026-11-19 03:56:54+00:00'),
+                    ('still-running', '', 'CASCADE_RUN_STATUS_RUNNING', 1, 0, '2026-11-19 03:56:54+00:00'),
+                    ('just-started', '', 'CASCADE_RUN_STATUS_IDLE', 0, 0, '2020-01-01 00:00:00+00:00'),
+                ],
+            )
+        bridge.receive('antigravity', 'PreInvocation', {'conversationId': 'stuck-idle', 'lastUserInput': '出错暂停'}, self.data, now=now - 60)
+        bridge.receive('antigravity', 'PreInvocation', {'conversationId': 'stuck-killed', 'lastUserInput': '手动中止'}, self.data, now=now - 1)
+        bridge.receive('antigravity', 'PreInvocation', {'conversationId': 'still-running', 'lastUserInput': '仍在运行'}, self.data, now=now - 60)
+        bridge.receive('antigravity', 'PreInvocation', {'conversationId': 'just-started', 'lastUserInput': '刚刚开始'}, self.data, now=now)
+        monitor = self.monitor()
+        self.assertEqual(set(monitor.entries), {'antigravity:still-running', 'antigravity:just-started'})
+
+    def test_dismissing_running_task_hides_only_running_state_for_turn(self):
+        started = bridge.receive('cursor', 'beforeSubmitPrompt', {'conversation_id': 'c1', 'prompt': '构建'}, self.data)
+        p.atomic_json(self.data / 'dismissed.json', {started['id']: started['turn'] + ':running'})
+        monitor = self.monitor()
+        self.assertEqual(monitor.entries, {})
+        bridge.receive('cursor', 'stop', {'conversation_id': 'c1'}, self.data)
+        monitor.tick()
+        self.assertIn(started['id'], monitor.entries)
+        self.assertEqual(monitor.entries[started['id']]['status'], 'completed')
+
 
 if __name__ == '__main__':
     unittest.main()

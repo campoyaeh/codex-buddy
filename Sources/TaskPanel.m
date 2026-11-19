@@ -106,7 +106,9 @@ static NSTextField *Label(NSString *text, CGFloat size, NSColor *color) {
 }
 static NSString *DismissalKey(NSDictionary *task) {
     NSString *turn = task[@"turn"] ?: @"";
-    return [task[@"status"] isEqual:@"completed"] ? [turn stringByAppendingString:@":completed"] : turn;
+    if ([task[@"status"] isEqual:@"completed"]) return [turn stringByAppendingString:@":completed"];
+    if ([task[@"status"] isEqual:@"running"]) return [turn stringByAppendingString:@":running"];
+    return turn;
 }
 static NSColor *StatusColor(NSString *status) {
     if ([status isEqual:@"waiting"]) return NSColor.systemYellowColor;
@@ -349,7 +351,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     NSMutableArray *tasks = [NSMutableArray array];
     for (NSDictionary *task in incoming) {
         BOOL active = [@[@"running", @"waiting", @"completed"] containsObject:task[@"status"]];
-        BOOL dismissed = ![task[@"status"] isEqual:@"running"] && [self.dismissed[task[@"id"]] isEqual:DismissalKey(task)];
+        BOOL dismissed = [self.dismissed[task[@"id"]] isEqual:DismissalKey(task)];
         if (active && !dismissed) [tasks addObject:task];
     }
     NSString *error = snapshot[@"error"] ?: self.monitorError ?: @"";
@@ -518,7 +520,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     [NSWorkspace.sharedWorkspace openURL:accessibility];
 }
 
-- (void)copyAntigravitySearchID:(NSString *)conversationID permission:(BOOL)permission {
+- (void)copyAntigravitySearchID:(NSString *)conversationID permission:(BOOL)permission rebuild:(BOOL)shouldRebuild {
     NSPasteboard *clipboard = NSPasteboard.generalPasteboard;
     [clipboard clearContents];
     BOOL copied = [clipboard setString:conversationID forType:NSPasteboardTypeString];
@@ -527,7 +529,9 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         message = permission ? @"「工头喵」尚未授权。已复制会话 ID，按 ⌘K 粘贴搜索。" :
             @"已复制会话 ID，在 Antigravity 按 ⌘K 粘贴搜索。";
     }
-    [self showAntigravityNotice:message permission:permission];
+    self.antigravityNotice = message;
+    self.antigravityNeedsPermission = permission;
+    if (shouldRebuild) [self rebuild];
 }
 
 - (void)openAntigravityTask:(NSDictionary *)task row:(NSView *)row {
@@ -560,17 +564,16 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
                 }
                 if (!AXIsProcessTrusted()) {
                     finish();
-                    [self copyAntigravitySearchID:conversationID permission:YES];
+                    [self copyAntigravitySearchID:conversationID permission:YES rebuild:NO];
+                    [self finishOpeningTask:task row:row opened:YES];
+                    if (!self.removingTasks.count) [self rebuild];
                     return;
                 }
                 OpenAntigravityConversation(app,conversationID,^(BOOL opened) {
                     finish();
-                    if (opened) {
-                        [self finishOpeningTask:task row:row opened:YES];
-                        if (!self.removingTasks.count) [self rebuild];
-                    } else {
-                        [self copyAntigravitySearchID:conversationID permission:!AXIsProcessTrusted()];
-                    }
+                    if (!opened) [self copyAntigravitySearchID:conversationID permission:!AXIsProcessTrusted() rebuild:NO];
+                    [self finishOpeningTask:task row:row opened:YES];
+                    if (!self.removingTasks.count) [self rebuild];
                 });
             });
         }];
@@ -629,7 +632,8 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
             [pasteboard clearContents];
             [pasteboard setString:task[@"resume_command"] forType:NSPasteboardTypeString];
             self.monitorError = @"已复制会话恢复命令，请粘贴到终端运行";
-            [self rebuild];
+            [self finishOpeningTask:task row:sender.superview opened:YES];
+            if (!self.removingTasks.count) [self rebuild];
             return;
         }
     }
@@ -653,7 +657,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
 }
 - (void)markTaskRead:(NSMenuItem *)sender {
     for (NSDictionary *task in self.tasks) if ([task[@"id"] isEqual:sender.representedObject]) {
-        [self dismissEntry:task row:nil];
+        [self dismissEntry:task row:nil allowRunning:YES];
         return;
     }
 }
@@ -743,7 +747,10 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
 - (void)setupIntegrations:(id)sender { [self runIntegrationScriptWithArgs:nil]; }
 - (void)removeIntegrations:(id)sender { [self runIntegrationScriptWithArgs:@[@"--remove"]]; }
 - (void)dismissEntry:(NSDictionary *)task row:(NSView *)row {
-    if ([task[@"status"] isEqual:@"running"] || [self.removingTasks containsObject:task[@"id"]]) return;
+    [self dismissEntry:task row:row allowRunning:NO];
+}
+- (void)dismissEntry:(NSDictionary *)task row:(NSView *)row allowRunning:(BOOL)allowRunning {
+    if ((!allowRunning && [task[@"status"] isEqual:@"running"]) || [self.removingTasks containsObject:task[@"id"]]) return;
     NSString *threadID = task[@"id"];
     NSMutableDictionary *dismissed = [ReadJSON(@"dismissed.json") mutableCopy] ?: [NSMutableDictionary dictionary];
     dismissed[threadID] = DismissalKey(task);
@@ -763,7 +770,10 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         [row.animator setFrame:NSOffsetRect(row.frame, 18, 0)];
     } completionHandler:^{
         NSMutableArray *remaining = [self.tasks mutableCopy];
-        [remaining removeObject:task];
+        NSIndexSet *matches = [remaining indexesOfObjectsPassingTest:^BOOL(NSDictionary *entry, NSUInteger idx, BOOL *stop) {
+            return [entry[@"id"] isEqual:threadID] && [DismissalKey(entry) isEqual:DismissalKey(task)];
+        }];
+        [remaining removeObjectsAtIndexes:matches];
         self.tasks = remaining;
         if (!remaining.count && !self.showingHistory) self.collapsed = YES;
         [self.removingTasks removeObject:threadID];
@@ -916,8 +926,9 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         row.fillColor = [color colorWithAlphaComponent:0.055];
         row.layer.cornerRadius = 8;
         NSMenu *rowMenu = [NSMenu new];
-        if (!self.showingHistory && ![@"running" isEqual:task[@"status"]]) {
-            NSMenuItem *read = [rowMenu addItemWithTitle:@"标为已读" action:@selector(markTaskRead:) keyEquivalent:@""];
+        if (!self.showingHistory) {
+            NSString *title = [@"running" isEqual:task[@"status"]] ? @"移出列表" : @"标为已读";
+            NSMenuItem *read = [rowMenu addItemWithTitle:title action:@selector(markTaskRead:) keyEquivalent:@""];
             read.target = self; read.representedObject = task[@"id"];
         }
         if ([task[@"resume_command"] length]) {

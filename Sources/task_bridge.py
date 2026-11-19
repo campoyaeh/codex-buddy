@@ -65,9 +65,15 @@ def receive(provider, event, payload, data, now=None):
             if event in ('PreToolUse', 'preToolUse', 'BeforeTool') and tool_name in ('AskUserQuestion', 'ask_user_question', 'ask_user', 'request_user_input', 'ask_followup_question'):
                 status = 'waiting'
         elif event in DONE:
+            termination = str(payload.get('terminationReason') or '').lower()
+            raw_status = str(payload.get('status') or '').lower()
             if provider == 'antigravity' and payload.get('fullyIdle') is False:
                 status = 'running'
-            elif payload.get('error') or payload.get('terminationReason') in ('error', 'max_steps_exceeded', 'cancelled', 'user_cancelled') or payload.get('status') in ('aborted', 'error', 'cancelled'):
+            elif (payload.get('error')
+                  or termination in ('error', 'max_steps_exceeded', 'max_invocations', 'max_forced_invocations',
+                                     'max_token_budget_exceeded', 'canceled', 'cancelled', 'user_canceled',
+                                     'user_cancelled', 'terminal_custom_hook')
+                  or raw_status in ('aborted', 'error', 'canceled', 'cancelled')):
                 status = 'stopped'
             elif previous.get('status') == 'waiting':
                 status = 'waiting'

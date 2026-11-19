@@ -64,16 +64,52 @@ def task(provider, session, turn, title, status, **extra):
                 status=status, **extra)
 
 
-def set_antigravity_navigation_targets(home, history):
+def parse_timestamp(value):
+    if value is None or value == '':
+        return 0
+    try:
+        number = float(value)
+        return number / 1000 if number > 100000000000 else number
+    except (ValueError, TypeError):
+        try:
+            text = str(value).strip().replace('Z', '+00:00')
+            if ' ' in text and 'T' not in text:
+                text = text.replace(' ', 'T', 1)
+            text = re.sub(r'\.(\d+)', lambda match: '.' + (match.group(1) + '000000')[:6], text)
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            return 0
+
+
+def set_antigravity_navigation_targets(home, history, entries=None):
     tasks = [entry for entry in history.values() if entry.get('provider') == 'antigravity']
     path = home / '.gemini/antigravity/conversation_summaries.db'
     if not tasks or not path.is_file():
         return
     query = ("SELECT conversation_id, parent_conversation_id FROM conversation_summaries "
              "WHERE parent_conversation_id <> ''")
+    running_sessions = []
+    if entries is not None:
+        running_sessions = [entry['session'] for entry in entries.values()
+                            if entry.get('provider') == 'antigravity' and entry.get('status') == 'running' and entry.get('session')]
+
+    def load(connection):
+        parents = dict(connection.execute(query))
+        states = {}
+        if running_sessions:
+            columns = {row[1] for row in connection.execute('PRAGMA table_info(conversation_summaries)')}
+            if {'status', 'not_fully_idle', 'killed'}.issubset(columns):
+                modified_col = 'last_modified_time' if 'last_modified_time' in columns else "''"
+                placeholders = ','.join('?' for _ in running_sessions)
+                state_query = (f"SELECT conversation_id, status, not_fully_idle, killed, {modified_col} "
+                               f"FROM conversation_summaries WHERE conversation_id IN ({placeholders})")
+                for cid, db_status, not_fully_idle, killed, modified in connection.execute(state_query, running_sessions):
+                    states[cid] = (db_status, not_fully_idle, killed, modified)
+        return parents, states
+
     try:
         with closing(database(path)) as connection:
-            parents = dict(connection.execute(query))
+            parents, states = load(connection)
     except sqlite3.Error:
         # SQLite can refuse a read-only open of an idle WAL-mode database
         # whose client removed the sidecars. Never ignore an existing WAL.
@@ -83,7 +119,7 @@ def set_antigravity_navigation_targets(home, history):
         try:
             before = path.stat()
             with closing(sqlite3.connect(path.as_uri() + '?mode=ro&immutable=1', uri=True)) as connection:
-                parents = dict(connection.execute(query))
+                parents, states = load(connection)
             if wal.exists() or path.stat().st_mtime_ns != before.st_mtime_ns:
                 return
         except (OSError, sqlite3.Error):
@@ -96,6 +132,23 @@ def set_antigravity_navigation_targets(home, history):
             visited.add(target)
         if target not in parents and target != entry.get('session'):
             entry['navigation_id'] = 'antigravity:' + target
+    if entries is not None and states:
+        now = time.time()
+        for key, entry in list(entries.items()):
+            if entry.get('provider') != 'antigravity' or entry.get('status') != 'running':
+                continue
+            state = states.get(entry.get('session'))
+            if not state:
+                continue
+            db_status, not_fully_idle, killed, modified = state
+            idle = bool(killed) or (db_status == 'CASCADE_RUN_STATUS_IDLE' and not not_fully_idle)
+            if not idle:
+                continue
+            event_ts = parse_timestamp(entry.get('updated'))
+            modified_ts = parse_timestamp(modified)
+            if bool(killed) or modified_ts >= event_ts - 2 or (event_ts and now - event_ts >= 5):
+                entry['status'] = 'stopped'
+                entries.pop(key, None)
 
 
 def deepseek_tasks(home):
@@ -427,7 +480,7 @@ class UnifiedMonitor:
                 entries[entry['id']] = entry
             else:
                 entries.pop(entry['id'], None)
-        set_antigravity_navigation_targets(self.home, history)
+        set_antigravity_navigation_targets(self.home, history, entries)
         for key, entry in history.items():
             if entry.get('navigation') == 'application' and self.installed.get(entry.get('provider')):
                 entry['app'] = Path(self.installed[entry['provider']][0]).stem
@@ -436,8 +489,9 @@ class UnifiedMonitor:
                 candidates = self.installed[entry['provider']]
                 if not any(Path(candidate).stem == entry.get('app') for candidate in candidates):
                     entry['app'] = Path(candidates[0]).stem
-            dismissal = entry['turn'] + (':completed' if entry['status'] == 'completed' else '')
-            if entry['status'] != 'running' and dismissed.get(key) == dismissal:
+            suffix = ':completed' if entry['status'] == 'completed' else (':running' if entry['status'] == 'running' else '')
+            dismissal = entry['turn'] + suffix
+            if dismissed.get(key) == dismissal:
                 del entries[key]
         priority = {'waiting': 0, 'completed': 1, 'running': 2}
         fields = {'id', 'turn', 'title', 'status', 'provider', 'source', 'navigation', 'navigation_id', 'open_url',

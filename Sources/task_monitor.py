@@ -203,8 +203,9 @@ class Monitor:
         for thread, task in self.states.items():
             status = task.get('status')
             turn = task.get('turn', '')
-            dismissal_key = turn + ':completed' if status == 'completed' else turn
-            if status in {'waiting', 'completed'} and self.dismissed.get(thread) == dismissal_key:
+            suffix = ':completed' if status == 'completed' else (':running' if status == 'running' else '')
+            dismissal_key = turn + suffix
+            if status in {'running', 'waiting', 'completed'} and self.dismissed.get(thread) == dismissal_key:
                 continue
             if status == 'completed':
                 # Refresh receipts even when the journal is unchanged. Existing

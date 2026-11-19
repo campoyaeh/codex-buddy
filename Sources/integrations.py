@@ -69,7 +69,12 @@ def merge_config(original, dialect, provider, events, bridge, data):
         current = result.get(MARKER)
         if current and not owned(current):
             raise ValueError('存在同名配置，未覆盖')
-        result[MARKER] = {event: [{'type': 'command', 'command': hook_command(bridge, provider, event, data), 'timeout': 5}] for event in events}
+        def antigravity_entry(event):
+            handler = {'type': 'command', 'command': hook_command(bridge, provider, event, data), 'timeout': 5}
+            if event in ('PreToolUse', 'PostToolUse'):
+                return [{'matcher': '*', 'hooks': [handler]}]
+            return [handler]
+        result[MARKER] = {event: antigravity_entry(event) for event in events}
         return result
     hooks = result.setdefault('hooks', {})
     if not isinstance(hooks, dict):
