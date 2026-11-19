@@ -596,7 +596,7 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
 - (instancetype)initWithDirectory:(NSString *)directory {
     if ((self = [super init])) {
         self.settingsPath = [directory stringByAppendingPathComponent:@"settings.json"];
-        self.settings = [@{@"enabled":@YES, @"duration":@4, @"intensity":@0.8, @"palette":@0, @"allScreens":@NO, @"style":@(CelebrationRandomStyle), @"styleVersion":@3, @"showStatusItem":@YES, @"mascotID":@"foreman", @"theme":@(PanelThemeDark)} mutableCopy];
+        self.settings = [@{@"enabled":@YES, @"duration":@4, @"intensity":@0.8, @"palette":@0, @"allScreens":@NO, @"style":@(CelebrationRandomStyle), @"styleVersion":@3, @"showStatusItem":@YES, @"mascotID":@"foreman", @"theme":@(PanelThemeDark), @"suppressAntigravityPermissionPrompt":@NO} mutableCopy];
         NSData *data = [NSData dataWithContentsOfFile:self.settingsPath];
         id saved = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
         if ([saved isKindOfClass:NSDictionary.class]) {

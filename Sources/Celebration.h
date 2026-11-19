@@ -45,5 +45,6 @@ FOUNDATION_EXPORT NSString *CelebrationRandomMessage(NSString *previous);
 - (void)stop;
 - (void)showSettings:(id)sender;
 - (void)changeSetting:(NSControl *)sender;
+- (void)saveChange:(NSString *)key;
 - (void)preview:(id)sender;
 @end

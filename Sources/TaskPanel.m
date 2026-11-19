@@ -620,7 +620,21 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     [self rebuild];
 }
 
+- (void)dismissAntigravityNotice:(id)sender {
+    if (self.antigravityNeedsPermission) {
+        self.celebration.settings[@"suppressAntigravityPermissionPrompt"] = @YES;
+        [self.celebration saveChange:@"suppressAntigravityPermissionPrompt"];
+    }
+    self.antigravityNotice = nil;
+    self.antigravityNeedsPermission = NO;
+    [self rebuild];
+}
+
 - (void)requestAntigravityAccess:(id)sender {
+    if ([self.celebration.settings[@"suppressAntigravityPermissionPrompt"] boolValue]) {
+        self.celebration.settings[@"suppressAntigravityPermissionPrompt"] = @NO;
+        [self.celebration saveChange:@"suppressAntigravityPermissionPrompt"];
+    }
     NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
     BOOL trusted = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
     if (!trusted) [self showAntigravityNotice:@"请在系统设置中开启「工头喵」，再点击任务。" permission:YES];
@@ -632,6 +646,12 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     NSPasteboard *clipboard = NSPasteboard.generalPasteboard;
     [clipboard clearContents];
     BOOL copied = [clipboard setString:conversationID forType:NSPasteboardTypeString];
+    if (copied && permission && [self.celebration.settings[@"suppressAntigravityPermissionPrompt"] boolValue]) {
+        self.antigravityNotice = nil;
+        self.antigravityNeedsPermission = NO;
+        if (shouldRebuild) [self rebuild];
+        return;
+    }
     NSString *message = @"无法复制会话 ID，请重试。";
     if (copied) {
         message = permission ? @"「工头喵」尚未授权。已复制会话 ID，按 ⌘K 粘贴搜索。" :
@@ -990,13 +1010,21 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         NSTextField *notice = [NSTextField wrappingLabelWithString:self.antigravityNotice];
         notice.font = [NSFont systemFontOfSize:12];
         notice.textColor = NSColor.secondaryLabelColor;
-        notice.frame = NSMakeRect(16,8,width - (self.antigravityNeedsPermission ? 98 : 32),34);
+        notice.frame = NSMakeRect(16,8,width - (self.antigravityNeedsPermission ? 118 : 50),34);
         [root addSubview:notice];
         if (self.antigravityNeedsPermission) {
             NSButton *authorize = [TaskButton buttonWithTitle:@"去授权" target:self action:@selector(requestAntigravityAccess:)];
-            authorize.frame = NSMakeRect(width-74,12,62,26);
+            authorize.frame = NSMakeRect(width-96,12,62,26);
             [root addSubview:authorize];
         }
+        TaskButton *dismiss = [TaskButton buttonWithTitle:@"×" target:self action:@selector(dismissAntigravityNotice:)];
+        dismiss.bordered = NO;
+        dismiss.font = [NSFont systemFontOfSize:14 weight:NSFontWeightMedium];
+        dismiss.contentTintColor = NSColor.secondaryLabelColor;
+        dismiss.accessibilityLabel = @"关闭提示";
+        dismiss.toolTip = self.antigravityNeedsPermission ? @"关闭并不再提示授权" : @"关闭提示";
+        dismiss.frame = NSMakeRect(width-30,13,22,24);
+        [root addSubview:dismiss];
     }
     if (self.monitorError.length) {
         title.textColor = NSColor.systemOrangeColor;
