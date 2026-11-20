@@ -1,5 +1,6 @@
 #import "Celebration.h"
 #import "PanelTheme.h"
+#import "InputMirror.h"
 
 const CGFloat CelebrationArtworkCornerRadius = 36;
 const NSInteger CelebrationRandomStyle = -1;
@@ -25,7 +26,7 @@ NSRect CelebrationOverlayFrame(NSRect visibleFrame) {
     CGFloat height = MIN(340, NSHeight(visibleFrame) * 0.85);
     CGFloat centerY = NSMaxY(visibleFrame) - NSHeight(visibleFrame) / 3;
     CGFloat y = MIN(centerY - height / 2, NSMaxY(visibleFrame) - height);
-    return NSMakeRect(NSMidX(visibleFrame) - width / 2, y, width, height);
+    return NSMakeRect(round(NSMidX(visibleFrame) - width / 2), round(y), round(width), round(height));
 }
 
 NSArray<NSString *> *CelebrationMessages(void) {
@@ -596,11 +597,12 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
 - (instancetype)initWithDirectory:(NSString *)directory {
     if ((self = [super init])) {
         self.settingsPath = [directory stringByAppendingPathComponent:@"settings.json"];
-        self.settings = [@{@"enabled":@YES, @"duration":@4, @"intensity":@0.8, @"palette":@0, @"allScreens":@NO, @"style":@(CelebrationRandomStyle), @"styleVersion":@3, @"showStatusItem":@YES, @"mascotID":@"foreman", @"theme":@(PanelThemeDark), @"suppressAntigravityPermissionPrompt":@NO} mutableCopy];
+        self.settings = [@{@"enabled":@YES, @"duration":@4, @"intensity":@0.8, @"palette":@0, @"allScreens":@NO, @"style":@(CelebrationRandomStyle), @"styleVersion":@3, @"showStatusItem":@YES, @"mascotID":@"foreman", @"theme":@(PanelThemeDark), @"suppressAntigravityPermissionPrompt":@NO, @"inputMirrorEnabled":@NO, @"inputMirrorStyle":@(InputMirrorStyleGlass), @"inputMirrorExcludeIDEs":@NO, @"autoCollapsePanel":@NO, @"doNotDisturb":@NO, @"hideUninstalledSources":@NO, @"disabledProviders":@[]} mutableCopy];
         NSData *data = [NSData dataWithContentsOfFile:self.settingsPath];
         id saved = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
         if ([saved isKindOfClass:NSDictionary.class]) {
             for (NSString *key in self.settings.allKeys) if ([self.settings[key] isKindOfClass:NSNumber.class] && [saved[key] isKindOfClass:NSNumber.class]) self.settings[key] = saved[key];
+            if ([saved[@"disabledProviders"] isKindOfClass:NSArray.class]) self.settings[@"disabledProviders"] = saved[@"disabledProviders"];
             self.settings[@"mascotID"] = MascotDefinition(saved[@"mascotID"])[@"id"];
         }
         double duration = [self.settings[@"duration"] doubleValue];
@@ -624,7 +626,7 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
     return self;
 }
 - (void)showOnScreen:(NSScreen *)screen {
-    if (![self.settings[@"enabled"] boolValue] || self.overlays.count) return;
+    if (![self.settings[@"enabled"] boolValue] || [self.settings[@"doNotDisturb"] boolValue] || self.overlays.count) return;
     NSArray *screens = [self.settings[@"allScreens"] boolValue] ? NSScreen.screens : (screen ? @[screen] : @[]);
     if (!screens.count) return;
     NSString *message = CelebrationRandomMessage(self.lastMessage);
@@ -685,7 +687,7 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
     [self.overlays removeAllObjects];
 }
 - (void)changeSetting:(NSControl *)sender {
-    NSArray *keys = @[@"enabled",@"palette",@"duration",@"intensity",@"allScreens",@"style",@"showStatusItem"];
+    NSArray *keys = @[@"enabled",@"palette",@"duration",@"intensity",@"allScreens",@"style",@"showStatusItem",@"inputMirrorEnabled",@"autoCollapsePanel",@"inputMirrorStyle",@"inputMirrorExcludeIDEs"];
     NSString *key = keys[sender.tag];
     if ([sender isKindOfClass:NSPopUpButton.class]) {
         NSInteger index = [(NSPopUpButton *)sender indexOfSelectedItem];
@@ -772,21 +774,89 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
     [self.settingsWindow center]; [self.settingsWindow makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES];
     [self preview:nil];
 }
+static PanelSurface *SettingsCard(NSRect frame) {
+    PanelSurface *card = [[PanelSurface alloc] initWithFrame:frame];
+    card.wantsLayer = YES;
+    card.layer.cornerRadius = 14.0;
+    card.layer.borderWidth = 1.0;
+    card.fillColor = PanelColor(0xffffff, 0x22262e, 1.0);
+    card.outlineColor = PanelColor(0xe2e8f0, 0x313744, 1.0);
+    return card;
+}
+static PanelSurface *SettingsRowDivider(CGFloat x, CGFloat y, CGFloat width) {
+    PanelSurface *line = [[PanelSurface alloc] initWithFrame:NSMakeRect(x, y, width, 1.0)];
+    line.fillColor = PanelColor(0xedf0f5, 0x2f3542, 0.9);
+    return line;
+}
+- (void)registerTabView:(NSView *)view forTab:(NSInteger)tabIndex {
+    if (!view || tabIndex < 0 || tabIndex >= (NSInteger)self.settingsTabGroups.count) return;
+    [self.settingsTabGroups[tabIndex] addObject:view];
+    view.hidden = (self.settingsTabControl.selectedSegment != tabIndex);
+}
+- (void)switchSettingsTab:(NSSegmentedControl *)sender {
+    [self selectSettingsTab:sender.selectedSegment];
+}
+- (void)selectSettingsTab:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger)self.settingsTabGroups.count) index = 0;
+    self.settingsTabControl.selectedSegment = index;
+    for (NSInteger t = 0; t < (NSInteger)self.settingsTabGroups.count; t++) {
+        BOOL hidden = (t != index);
+        for (NSView *v in self.settingsTabGroups[t]) v.hidden = hidden;
+    }
+    if (index == 2) {
+        [self preview:nil];
+    } else {
+        [self stopPreview];
+    }
+}
 - (void)buildSettings {
     if (self.settingsWindow) return;
-    self.settingsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,900,760) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
+    self.settingsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,780,560) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
     self.settingsWindow.title = @"工头喵 · 主面板";
     self.settingsWindow.releasedWhenClosed = NO;
     self.settingsWindow.delegate = self;
     PanelSurface *root = [[PanelSurface alloc] initWithFrame:self.settingsWindow.contentView.frame];
-    root.fillColor = PanelColor(0xf7f8fb,0x1a1c21,1);
+    root.fillColor = PanelColor(0xf4f6fa,0x161920,1);
     self.settingsWindow.contentView = root;
-    NSTextField *roleHeading = [NSTextField labelWithString:@"选一位，陪你盯进度"];
-    roleHeading.font = [NSFont systemFontOfSize:23 weight:NSFontWeightSemibold];
-    roleHeading.frame = NSMakeRect(28,710,226,32); [root addSubview:roleHeading];
+
+    self.settingsTabGroups = @[[NSMutableArray array], [NSMutableArray array], [NSMutableArray array]];
+
+    // Top Navigation Bar: Segmented Tabs (left) + Quick Utility Actions (added by TaskPanel on right)
+    NSSegmentedControl *tabs = [NSSegmentedControl segmentedControlWithLabels:@[@"伙伴与外观", @"效率与浮窗", @"完成庆祝"]
+                                                                 trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                       target:self
+                                                                       action:@selector(switchSettingsTab:)];
+    tabs.segmentStyle = NSSegmentStyleAutomatic;
+    tabs.frame = NSMakeRect(24, 510, 324, 28);
+    tabs.selectedSegment = 0;
+    [root addSubview:tabs];
+    self.settingsTabControl = tabs;
+
+    [root addSubview:SettingsRowDivider(24, 496, 732)];
+
+    void (^addToTab)(NSView *, NSInteger) = ^(NSView *v, NSInteger tab) {
+        [root addSubview:v];
+        [self registerTabView:v forTab:tab];
+    };
+
+    // ==================== TAB 0: 伙伴与外观 ====================
+    addToTab(SettingsCard(NSMakeRect(24, 266, 732, 212)), 0);
+    addToTab(SettingsCard(NSMakeRect(24, 52, 732, 198)), 0);
+
+    NSTextField *roleHeading = [NSTextField labelWithString:@"工头喵小队"];
+    roleHeading.font = [NSFont systemFontOfSize:15.5 weight:NSFontWeightSemibold];
+    roleHeading.frame = NSMakeRect(44, 444, 140, 22);
+    addToTab(roleHeading, 0);
+
+    NSTextField *roleSub = [NSTextField labelWithString:@"切换后，任务浮窗头像、菜单栏与庆祝动效同步变身"];
+    roleSub.font = [NSFont systemFontOfSize:12];
+    roleSub.textColor = NSColor.secondaryLabelColor;
+    roleSub.frame = NSMakeRect(142, 445, 420, 18);
+    addToTab(roleSub, 0);
+
     NSInteger roleIndex = 0;
     for (NSDictionary *role in MascotCatalog()) {
-        MascotChoiceButton *choice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(28+(roleIndex++)*142,550,128,132)];
+        MascotChoiceButton *choice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(42+(roleIndex++)*118, 308, 108, 120)];
         choice.mascotID = role[@"id"];
         choice.chosen = [role[@"id"] isEqual:self.settings[@"mascotID"]];
         choice.target = self; choice.action = @selector(changeMascot:);
@@ -794,80 +864,210 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
         choice.toolTip = [NSString stringWithFormat:@"%@\n%@",role[@"name"],role[@"description"]];
         choice.accessibilityLabel = [NSString stringWithFormat:@"选择%@",role[@"name"]];
         choice.accessibilityValue = choice.chosen ? @"已选择" : @"未选择";
-        [root addSubview:choice];
+        addToTab(choice, 0);
     }
     self.mascotDescription = [NSTextField labelWithString:MascotDefinition(self.settings[@"mascotID"])[@"description"]];
     self.mascotDescription.textColor = NSColor.secondaryLabelColor;
     self.mascotDescription.font = [NSFont systemFontOfSize:12];
-    self.mascotDescription.frame = NSMakeRect(28,506,842,23); [root addSubview:self.mascotDescription];
-    NSBox *section = [[NSBox alloc] initWithFrame:NSMakeRect(28,480,842,1)]; section.boxType = NSBoxSeparator; [root addSubview:section];
-    NSButton *statusItem = [NSButton checkboxWithTitle:@"在状态栏显示任务数量" target:self action:@selector(changeSetting:)];
-    statusItem.frame = NSMakeRect(28,136,420,24);
-    statusItem.tag = 6;
-    statusItem.state = [self.settings[@"showStatusItem"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
-    [root addSubview:statusItem];
+    self.mascotDescription.frame = NSMakeRect(44, 278, 692, 20);
+    addToTab(self.mascotDescription, 0);
+
+    NSTextField *baseHeading = [NSTextField labelWithString:@"基础与外观"];
+    baseHeading.font = [NSFont systemFontOfSize:15.5 weight:NSFontWeightSemibold];
+    baseHeading.frame = NSMakeRect(44, 214, 200, 22);
+    addToTab(baseHeading, 0);
+
+    // Row 1: Theme
     NSTextField *themeLabel = [NSTextField labelWithString:@"界面主题"];
-    themeLabel.frame = NSMakeRect(28,92,82,24);
-    [root addSubview:themeLabel];
-    NSPopUpButton *theme = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(120,92,192,26) pullsDown:NO];
+    themeLabel.font = [NSFont systemFontOfSize:13];
+    themeLabel.frame = NSMakeRect(44, 174, 140, 22);
+    addToTab(themeLabel, 0);
+    NSPopUpButton *theme = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(564, 172, 172, 26) pullsDown:NO];
     [theme addItemsWithTitles:PanelThemeTitles()];
     [theme selectItemAtIndex:[self.settings[@"theme"] integerValue]];
     theme.accessibilityLabel = @"界面主题";
     theme.target = self;
     theme.action = @selector(changeTheme:);
-    [root addSubview:theme];
+    addToTab(theme, 0);
     self.themeControl = theme;
-    NSTextField *heading = [NSTextField labelWithString:@"任务完成提示"];
-    heading.font = [NSFont systemFontOfSize:22 weight:NSFontWeightSemibold];
-    heading.frame = NSMakeRect(28,426,420,30);
-    [root addSubview:heading];
+
+    addToTab(SettingsRowDivider(44, 158, 692), 0);
+
+    // Row 2: Status bar & floating task panel
+    NSTextField *panelRowLabel = [NSTextField labelWithString:@"菜单栏与任务浮窗"];
+    panelRowLabel.font = [NSFont systemFontOfSize:13];
+    panelRowLabel.frame = NSMakeRect(44, 122, 140, 22);
+    addToTab(panelRowLabel, 0);
+    NSButton *statusItem = [NSButton checkboxWithTitle:@"在状态栏显示任务数量" target:self action:@selector(changeSetting:)];
+    statusItem.frame = NSMakeRect(384, 122, 194, 22);
+    statusItem.tag = 6;
+    statusItem.state = [self.settings[@"showStatusItem"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    addToTab(statusItem, 0);
+
+    addToTab(SettingsRowDivider(44, 108, 692), 0);
+
+    // Row 3: Launch at login & Accessibility (controls injected by TaskPanel on right)
+    NSTextField *sysRowLabel = [NSTextField labelWithString:@"自启动与系统权限"];
+    sysRowLabel.font = [NSFont systemFontOfSize:13];
+    sysRowLabel.frame = NSMakeRect(44, 70, 140, 22);
+    addToTab(sysRowLabel, 0);
+
+    // ==================== TAB 1: 效率与浮窗 ====================
+    addToTab(SettingsCard(NSMakeRect(24, 326, 732, 152)), 1);
+    addToTab(SettingsCard(NSMakeRect(24, 52, 732, 258)), 1);
+
+    // Card 1: Single-screen auto-collapse
+    NSTextField *collapseHeading = [NSTextField labelWithString:@"单屏省空间 · 自动收起"];
+    collapseHeading.font = [NSFont systemFontOfSize:15.5 weight:NSFontWeightSemibold];
+    collapseHeading.frame = NSMakeRect(44, 444, 260, 22);
+    addToTab(collapseHeading, 1);
+
+    NSButton *autoCollapse = [NSButton checkboxWithTitle:@"开启单屏自动收起" target:self action:@selector(changeSetting:)];
+    autoCollapse.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    autoCollapse.frame = NSMakeRect(44, 408, 260, 22);
+    autoCollapse.tag = 8;
+    autoCollapse.state = [self.settings[@"autoCollapsePanel"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    addToTab(autoCollapse, 1);
+    self.autoCollapseCheckbox = autoCollapse;
+
+    NSTextField *collapseDesc = [NSTextField wrappingLabelWithString:@"• 默认保持小胶囊收起状态，不遮挡单屏编码视野\n• 鼠标移入自动展开、移出 1 秒后自动收缩；新任务或状态变更展开 10 秒后自动收缩"];
+    collapseDesc.font = [NSFont systemFontOfSize:12];
+    collapseDesc.textColor = NSColor.secondaryLabelColor;
+    collapseDesc.frame = NSMakeRect(44, 344, 692, 52);
+    addToTab(collapseDesc, 1);
+
+    // Card 2: Multi-screen Input Mirror
+    NSTextField *mirrorHeading = [NSTextField labelWithString:@"多屏防扭头 · 全局输入镜像"];
+    mirrorHeading.font = [NSFont systemFontOfSize:15.5 weight:NSFontWeightSemibold];
+    mirrorHeading.frame = NSMakeRect(44, 274, 280, 22);
+    addToTab(mirrorHeading, 1);
+
+    NSButton *mirrorReset = [NSButton buttonWithTitle:@"重置位置" target:self action:@selector(triggerInputMirrorReset:)];
+    mirrorReset.bezelStyle = NSBezelStyleRounded;
+    mirrorReset.frame = NSMakeRect(536, 270, 96, 28);
+    mirrorReset.toolTip = @"将输入镜像浮窗恢复到主屏幕默认居中位置";
+    addToTab(mirrorReset, 1);
+    self.inputMirrorResetButton = mirrorReset;
+
+    NSButton *mirrorPreview = [NSButton buttonWithTitle:@"预览浮窗" target:self action:@selector(triggerInputMirrorPreview:)];
+    mirrorPreview.bezelStyle = NSBezelStyleRounded;
+    mirrorPreview.frame = NSMakeRect(640, 270, 96, 28);
+    addToTab(mirrorPreview, 1);
+    self.inputMirrorPreviewButton = mirrorPreview;
+
+    NSButton *inputMirror = [NSButton checkboxWithTitle:@"开启全局输入镜像浮窗（快捷键 ⌥⌘M）" target:self action:@selector(changeSetting:)];
+    inputMirror.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    inputMirror.frame = NSMakeRect(44, 234, 320, 22);
+    inputMirror.tag = 7;
+    inputMirror.state = [self.settings[@"inputMirrorEnabled"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    addToTab(inputMirror, 1);
+    self.inputMirrorCheckbox = inputMirror;
+
+    NSButton *excludeIDEs = [NSButton checkboxWithTitle:@"忽略 IDE 编辑器（VS Code / Cursor 等）" target:self action:@selector(changeSetting:)];
+    excludeIDEs.font = [NSFont systemFontOfSize:12.5];
+    excludeIDEs.frame = NSMakeRect(390, 234, 346, 22);
+    excludeIDEs.tag = 10;
+    excludeIDEs.toolTip = @"避免在 VS Code、Cursor、Windsurf、TRAE、Qoder、CodeBuddy 的搜索框或代码编辑区误弹出";
+    excludeIDEs.state = [self.settings[@"inputMirrorExcludeIDEs"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    addToTab(excludeIDEs, 1);
+    self.inputMirrorExcludeIDEsCheckbox = excludeIDEs;
+
+    addToTab(SettingsRowDivider(44, 214, 692), 1);
+
+    NSTextField *mirrorStyleLabel = [NSTextField labelWithString:@"浮窗视觉样式"];
+    mirrorStyleLabel.font = [NSFont systemFontOfSize:13];
+    mirrorStyleLabel.frame = NSMakeRect(44, 174, 140, 22);
+    addToTab(mirrorStyleLabel, 1);
+
+    NSPopUpButton *mirrorStyle = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(546, 172, 190, 26) pullsDown:NO];
+    [mirrorStyle addItemsWithTitles:InputMirrorStyleTitles()];
+    NSInteger savedMirrorStyle = [self.settings[@"inputMirrorStyle"] integerValue];
+    if (savedMirrorStyle < 0 || savedMirrorStyle >= (NSInteger)InputMirrorStyleTitles().count) savedMirrorStyle = 0;
+    [mirrorStyle selectItemAtIndex:savedMirrorStyle];
+    mirrorStyle.tag = 9;
+    mirrorStyle.target = self;
+    mirrorStyle.action = @selector(changeSetting:);
+    addToTab(mirrorStyle, 1);
+    self.inputMirrorStyleControl = mirrorStyle;
+
+    addToTab(SettingsRowDivider(44, 156, 692), 1);
+
+    NSTextField *mirrorHint = [NSTextField labelWithString:@"已关闭 · 仅对已支持的 AI 应用输入框生效"];
+    mirrorHint.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    mirrorHint.textColor = PanelColor(0x2563eb, 0x93c5fd, 1.0);
+    mirrorHint.frame = NSMakeRect(44, 122, 692, 20);
+    addToTab(mirrorHint, 1);
+    self.inputMirrorHint = mirrorHint;
+
+    NSTextField *mirrorDesc = [NSTextField wrappingLabelWithString:@"• 仅在 Codex、Antigravity、Cursor、Claude、千问、TRAE、CodeBuddy 等 AI 应用输入框弹出，不干扰其他软件\n• 支持跨屏拖动记忆、高度自适应、有序/无序列表格式、⌘A/C/V/Z 与 Enter 发送自动收起（自动排除密码框）"];
+    mirrorDesc.font = [NSFont systemFontOfSize:12];
+    mirrorDesc.textColor = NSColor.secondaryLabelColor;
+    mirrorDesc.frame = NSMakeRect(44, 68, 692, 46);
+    addToTab(mirrorDesc, 1);
+
+    // ==================== TAB 2: 完成庆祝 ====================
+    addToTab(SettingsCard(NSMakeRect(24, 52, 344, 426)), 2);
+    addToTab(SettingsCard(NSMakeRect(384, 52, 372, 426)), 2);
+
+    NSTextField *heading = [NSTextField labelWithString:@"任务完成庆祝"];
+    heading.font = [NSFont systemFontOfSize:15.5 weight:NSFontWeightSemibold];
+    heading.frame = NSMakeRect(44, 444, 200, 22);
+    addToTab(heading, 2);
+
     NSButton *enabled = [NSButton checkboxWithTitle:@"任务完成时显示庆祝弹窗" target:self action:@selector(changeSetting:)];
-    enabled.frame = NSMakeRect(28,384,420,24); enabled.tag = 0;
+    enabled.frame = NSMakeRect(44, 404, 300, 22); enabled.tag = 0;
     enabled.state = [self.settings[@"enabled"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
-    [root addSubview:enabled];
-    NSTextField *styleLabel = [NSTextField labelWithString:@"效果"];
-    styleLabel.frame = NSMakeRect(28,342,80,24); [root addSubview:styleLabel];
-    NSPopUpButton *style = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(120,342,300,26) pullsDown:NO];
+    addToTab(enabled, 2);
+
+    NSButton *screens = [NSButton checkboxWithTitle:@"在所有显示器上同时庆祝" target:self action:@selector(changeSetting:)];
+    screens.frame = NSMakeRect(44, 372, 300, 22); screens.tag = 4;
+    screens.state = [self.settings[@"allScreens"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    addToTab(screens, 2);
+
+    addToTab(SettingsRowDivider(44, 352, 304), 2);
+
+    NSTextField *styleLabel = [NSTextField labelWithString:@"动画效果"];
+    styleLabel.frame = NSMakeRect(44, 310, 72, 22); addToTab(styleLabel, 2);
+    NSPopUpButton *style = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(122, 308, 226, 26) pullsDown:NO];
     [style addItemWithTitle:@"随机"];
     [style addItemsWithTitles:CelebrationStyleTitles()];
     [style selectItemAtIndex:[self.settings[@"style"] integerValue] + 1];
-    style.tag = 5; style.target = self; style.action = @selector(changeSetting:); [root addSubview:style];
-    NSArray *labels = @[@"配色",@"时长",@"光效强度"];
-    for (NSInteger i=0;i<3;i++) {
-        NSTextField *label = [NSTextField labelWithString:labels[i]];
-        label.frame = NSMakeRect(28,300-i*42,80,24); [root addSubview:label];
-    }
-    NSPopUpButton *palette = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(120,300,240,26) pullsDown:NO];
+    style.tag = 5; style.target = self; style.action = @selector(changeSetting:); addToTab(style, 2);
+
+    NSTextField *paletteLabel = [NSTextField labelWithString:@"光效配色"];
+    paletteLabel.frame = NSMakeRect(44, 258, 72, 22); addToTab(paletteLabel, 2);
+    NSPopUpButton *palette = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(122, 256, 226, 26) pullsDown:NO];
     [palette addItemsWithTitles:@[@"暖光",@"冷光"]];
     [palette selectItemAtIndex:[self.settings[@"palette"] integerValue]];
-    palette.tag = 1; palette.target = self; palette.action = @selector(changeSetting:); [root addSubview:palette];
+    palette.tag = 1; palette.target = self; palette.action = @selector(changeSetting:); addToTab(palette, 2);
+
+    NSTextField *durLabelTitle = [NSTextField labelWithString:@"持续时长"];
+    durLabelTitle.frame = NSMakeRect(44, 204, 72, 22); addToTab(durLabelTitle, 2);
     NSSlider *duration = [NSSlider sliderWithValue:[self.settings[@"duration"] doubleValue] minValue:1 maxValue:4 target:self action:@selector(changeSetting:)];
     duration.continuous = NO;
-    duration.frame = NSMakeRect(120,260,240,24); duration.tag = 2; duration.accessibilityLabel = @"庆祝持续时间，1 至 4 秒"; [root addSubview:duration];
+    duration.frame = NSMakeRect(122, 204, 170, 24); duration.tag = 2; duration.accessibilityLabel = @"庆祝持续时间，1 至 4 秒"; addToTab(duration, 2);
     self.durationLabel = [NSTextField labelWithString:[NSString stringWithFormat:@"%.1f 秒",duration.doubleValue]];
-    self.durationLabel.frame = NSMakeRect(376,260,80,24); [root addSubview:self.durationLabel];
+    self.durationLabel.frame = NSMakeRect(298, 204, 52, 22); addToTab(self.durationLabel, 2);
+
+    NSTextField *intLabelTitle = [NSTextField labelWithString:@"光效强度"];
+    intLabelTitle.frame = NSMakeRect(44, 150, 72, 22); addToTab(intLabelTitle, 2);
     NSSlider *intensity = [NSSlider sliderWithValue:[self.settings[@"intensity"] doubleValue] minValue:0.4 maxValue:1.3 target:self action:@selector(changeSetting:)];
     intensity.continuous = NO;
-    intensity.frame = NSMakeRect(120,218,240,24); intensity.tag = 3; intensity.accessibilityLabel = @"光效强度"; [root addSubview:intensity];
-    NSButton *screens = [NSButton checkboxWithTitle:@"在所有显示器上庆祝" target:self action:@selector(changeSetting:)];
-    screens.frame = NSMakeRect(28,176,420,24); screens.tag = 4;
-    screens.state = [self.settings[@"allScreens"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff; [root addSubview:screens];
-    NSButton *preview = [NSButton buttonWithTitle:@"预览效果" target:self action:@selector(preview:)];
-    preview.bezelStyle = NSBezelStyleRounded; preview.frame = NSMakeRect(346,30,106,32); [root addSubview:preview];
-    self.saveStatus = [NSTextField labelWithString:@"自动保存 · 遵循系统减少动态效果设置"];
-    self.saveStatus.font = [NSFont systemFontOfSize:11]; self.saveStatus.textColor = NSColor.secondaryLabelColor;
-    self.saveStatus.frame = NSMakeRect(28,36,310,18); [root addSubview:self.saveStatus];
-    NSBox *divider = [[NSBox alloc] initWithFrame:NSMakeRect(470,28,1,444)];
-    divider.boxType = NSBoxSeparator; [root addSubview:divider];
+    intensity.frame = NSMakeRect(122, 150, 226, 24); intensity.tag = 3; intensity.accessibilityLabel = @"光效强度"; addToTab(intensity, 2);
+
+    // Right Card: Live Preview
     NSTextField *previewTitle = [NSTextField labelWithString:@"效果预览"];
-    previewTitle.font = [NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
-    previewTitle.frame = NSMakeRect(500,426,360,24); [root addSubview:previewTitle];
-    NSView *previewStage = [[NSView alloc] initWithFrame:NSMakeRect(500,94,368,320)];
-    [root addSubview:previewStage];
-    NSVisualEffectView *previewGlass = CelebrationGlass(NSMakeRect(0,32,368,282),NSVisualEffectBlendingModeWithinWindow);
+    previewTitle.font = [NSFont systemFontOfSize:15.5 weight:NSFontWeightSemibold];
+    previewTitle.frame = NSMakeRect(404, 444, 140, 22); addToTab(previewTitle, 2);
+    NSButton *preview = [NSButton buttonWithTitle:@"预览效果" target:self action:@selector(preview:)];
+    preview.bezelStyle = NSBezelStyleRounded; preview.frame = NSMakeRect(636, 440, 100, 28); addToTab(preview, 2);
+
+    NSView *previewStage = [[NSView alloc] initWithFrame:NSMakeRect(402, 126, 336, 294)];
+    addToTab(previewStage, 2);
+    NSVisualEffectView *previewGlass = CelebrationGlass(NSMakeRect(0, 30, 336, 258), NSVisualEffectBlendingModeWithinWindow);
     [previewStage addSubview:previewGlass];
-    self.previewView = [[CelebrationView alloc] initWithFrame:NSMakeRect(0,0,368,282)];
-    [self.previewView setBoundsSize:NSMakeSize(600,460)];
+    self.previewView = [[CelebrationView alloc] initWithFrame:NSMakeRect(0, 0, 336, 258)];
+    [self.previewView setBoundsSize:NSMakeSize(600, 460)];
     self.previewView.wantsLayer = YES;
     self.previewView.layer.cornerRadius = CelebrationArtworkCornerRadius;
     self.previewView.layer.masksToBounds = YES;
@@ -880,8 +1080,21 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
     self.interactionHint = [NSTextField labelWithString:@"将指针移入预览区互动"];
     self.interactionHint.textColor = NSColor.secondaryLabelColor;
     self.interactionHint.font = [NSFont systemFontOfSize:12];
-    self.interactionHint.frame = NSMakeRect(0,4,368,20);
+    self.interactionHint.frame = NSMakeRect(0, 4, 336, 20);
     self.interactionHint.hidden = !InteractiveStyle(self.previewView.style) || self.previewView.reducedMotion;
     [previewStage addSubview:self.interactionHint];
+
+    // Bottom status bar (always visible across all tabs)
+    self.saveStatus = [NSTextField labelWithString:@"设置自动保存 · 遵循系统减少动态效果设置"];
+    self.saveStatus.font = [NSFont systemFontOfSize:11.5]; self.saveStatus.textColor = NSColor.secondaryLabelColor;
+    self.saveStatus.frame = NSMakeRect(26, 18, 460, 18); [root addSubview:self.saveStatus];
+
+    [self selectSettingsTab:0];
+}
+- (void)triggerInputMirrorPreview:(id)sender {
+    if (self.previewInputMirror) self.previewInputMirror();
+}
+- (void)triggerInputMirrorReset:(id)sender {
+    if (self.resetInputMirrorPosition) self.resetInputMirrorPosition();
 }
 @end

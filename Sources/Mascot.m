@@ -145,7 +145,7 @@ NSImage *MascotImage(NSString *identifier, CGFloat size) {
     NSColor *fill = self.highlighted ? PanelColor(0xe5e9f0,0x383838,1) : PanelColor(0xffffff,0x242424,1);
     [(self.chosen ? [accent colorWithAlphaComponent:0.11] : fill) setFill]; [card fill];
     [(self.chosen ? accent : PanelColor(0xd3d9e2,0x454545,1)) setStroke]; card.lineWidth = self.chosen ? 1.6 : 0.6; [card stroke];
-    DrawMascot(self.mascotID,NSMakeRect((self.bounds.size.width-84)/2,38,84,84),@"idle");
+    DrawMascot(self.mascotID,NSMakeRect((self.bounds.size.width-76)/2,38,76,76),@"idle");
     NSDictionary *definition = MascotDefinition(self.mascotID);
     NSString *title = definition[@"name"];
     NSDictionary *attributes = @{NSFontAttributeName:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSForegroundColorAttributeName:self.chosen ? accent : NSColor.labelColor};

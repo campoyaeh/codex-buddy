@@ -246,35 +246,48 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(done['status'], 'completed')
         self.assertEqual(done['turn'], started['turn'])
 
-    def test_antigravity_nested_task_opens_root_and_keeps_its_own_receipt(self):
+    def test_antigravity_nested_subagent_tasks_are_hidden_from_lists(self):
         database = self.home / '.gemini/antigravity/conversation_summaries.db'
         database.parent.mkdir(parents=True)
         root = 'd1234567-89ab-cdef-0123-456789abcdff'
         child = '01234567-89ab-cdef-0123-456789abcdff'
         grandchild = '11234567-89ab-cdef-0123-456789abcdff'
+        depth_only = '31234567-89ab-cdef-0123-456789abcdff'
         loop = '21234567-89ab-cdef-0123-456789abcdff'
         with sqlite3.connect(database) as connection:
-            connection.execute("CREATE TABLE conversation_summaries (conversation_id TEXT, parent_conversation_id TEXT)")
-            connection.executemany("INSERT INTO conversation_summaries VALUES (?,?)",
-                                   [(root, ''), (child, root), (grandchild, child), (loop, loop)])
+            connection.execute("CREATE TABLE conversation_summaries (conversation_id TEXT, parent_conversation_id TEXT, nesting_depth INTEGER)")
+            connection.executemany(
+                "INSERT INTO conversation_summaries VALUES (?,?,?)",
+                [(root, '', 0), (child, root, 1), (grandchild, child, 2), (depth_only, '', 1), (loop, loop, 0)],
+            )
         parent = bridge.receive('antigravity', 'PreInvocation', {'conversationId': root}, self.data)
+        child_task = bridge.receive('antigravity', 'PreInvocation', {'conversationId': child}, self.data)
         reminder = bridge.receive('antigravity', 'Stop', {'conversationId': grandchild, 'fullyIdle': True}, self.data)
+        depth_task = bridge.receive('antigravity', 'PreInvocation', {'conversationId': depth_only}, self.data)
         loop_reminder = bridge.receive('antigravity', 'Stop', {'conversationId': loop, 'fullyIdle': True}, self.data)
         monitor = self.monitor()
-        self.assertEqual(monitor.entries[reminder['id']]['navigation_id'], parent['id'])
-        self.assertNotIn('navigation_id', monitor.entries[parent['id']])
-        self.assertNotIn('navigation_id', monitor.entries[loop_reminder['id']])
+        self.assertEqual(set(monitor.entries), {parent['id'], loop_reminder['id']})
+        self.assertNotIn(child_task['id'], monitor.entries)
+        self.assertNotIn(reminder['id'], monitor.entries)
+        self.assertNotIn(depth_task['id'], monitor.entries)
         snapshot = p.read_json(self.data / 'snapshot.json')
         for section in ('tasks', 'history'):
-            row = next(row for row in snapshot[section] if row['id'] == reminder['id'])
-            self.assertEqual(row['navigation_id'], parent['id'])
+            ids = {row['id'] for row in snapshot[section]}
+            self.assertIn(parent['id'], ids)
+            self.assertNotIn(child_task['id'], ids)
+            self.assertNotIn(reminder['id'], ids)
+            self.assertNotIn(depth_task['id'], ids)
         with patch.object(p, 'database', side_effect=sqlite3.OperationalError):
             monitor.tick()
-            self.assertEqual(monitor.entries[reminder['id']]['navigation_id'], parent['id'])
-        p.atomic_json(self.data / 'dismissed.json', {reminder['id']: reminder['turn'] + ':completed'})
-        monitor.tick()
-        self.assertNotIn(reminder['id'], monitor.entries)
-        self.assertEqual(monitor.entries[parent['id']]['status'], 'running')
+            self.assertEqual(set(monitor.entries), {parent['id'], loop_reminder['id']})
+
+    def test_bridge_filters_subagent_and_child_payloads(self):
+        self.assertIsNone(bridge.receive('claude', 'SubagentStart', {'session_id': 's1'}, self.data))
+        self.assertIsNone(bridge.receive('cursor', 'beforeSubmitPrompt', {'conversation_id': 'c1', 'isSubagent': True}, self.data))
+        self.assertIsNone(bridge.receive('antigravity', 'PreInvocation', {'conversationId': 'ag-child', 'parentConversationId': 'ag-root'}, self.data))
+        self.assertIsNone(bridge.receive('antigravity', 'PreInvocation', {'conversationId': 'ag-deep', 'nestingDepth': 1}, self.data))
+        self.assertIsNone(bridge.receive('copilot', 'userPromptSubmitted', {'sessionId': 'cp-child', 'parentSessionId': 'cp-root'}, self.data))
+        self.assertEqual(self.monitor().entries, {})
 
     def test_hook_failure_is_silent_and_does_not_block_client(self):
         script = Path(bridge.__file__)
@@ -512,6 +525,19 @@ class IntegrationTests(unittest.TestCase):
         monitor.tick()
         self.assertIn(started['id'], monitor.entries)
         self.assertEqual(monitor.entries[started['id']]['status'], 'completed')
+
+    def test_disabled_providers_are_filtered_and_restored(self):
+        bridge.receive('cursor', 'beforeSubmitPrompt', {'conversation_id': 'c2', 'prompt': '分析日志'}, self.data)
+        p.atomic_json(self.data / 'settings.json', {'disabledProviders': ['cursor']})
+        monitor = self.monitor()
+        self.assertEqual(monitor.entries, {})
+        snap = p.read_json(self.data / 'snapshot.json')
+        cursor_source = next(s for s in snap['sources'] if s['id'] == 'cursor')
+        self.assertEqual(cursor_source['state'], '已屏蔽')
+        self.assertTrue(cursor_source['disabled'])
+        p.atomic_json(self.data / 'settings.json', {'disabledProviders': []})
+        monitor.tick()
+        self.assertIn('cursor:c2', monitor.entries)
 
 
 if __name__ == '__main__':

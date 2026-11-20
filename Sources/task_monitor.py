@@ -142,21 +142,61 @@ class Monitor:
         self.states = {}
         self.dismissed = read_json(data / 'dismissed.json', {})
         self.last_output = None
+        self._db_sig = None
+        self._rows_cache = []
+        self._receipts_cache = {}
+        self._has_receipts = False
+        self._dismissed_sig = None
+        self._ordered_cache = []
+        self.changed = True
+
+    @staticmethod
+    def _file_sig(path):
+        try:
+            st = path.stat()
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
 
     def tick(self, publish=True):
-        self.dismissed = read_json(self.data / 'dismissed.json', self.dismissed)
-        with sqlite3.connect(f'file:{self.database}?mode=ro', uri=True, timeout=2) as connection:
-            has_receipts = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_read_receipts'").fetchone()
-            receipts = dict(connection.execute('SELECT thread_id, first_unread_turn FROM thread_read_receipts')) if has_receipts else {}
-            columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
-            updated = 'updated_at * 1000' if 'updated_at' in columns else '0'
-            if 'updated_at_ms' in columns:
-                updated = f'COALESCE(updated_at_ms, {updated})'
-            rows = connection.execute(f"SELECT {updated}, id, COALESCE(NULLIF(name,''),title), cwd, rollout_path FROM threads WHERE archived=0 AND thread_source IN ('user','automation','agent_created_thread') AND attached_thread_parent_id IS NULL").fetchall()
-        self.history = [dict(id=thread, title=' '.join((title or 'Codex 对话').split()),
-                             project=Path(cwd or '').name, updated=(updated or 0) / 1000,
-                             turn='', status='stopped')
-                        for updated, thread, title, cwd, filename in rows]
+        dismissed_sig = self._file_sig(self.data / 'dismissed.json')
+        dismissed_changed = dismissed_sig != self._dismissed_sig
+        if dismissed_changed:
+            self.dismissed = read_json(self.data / 'dismissed.json', self.dismissed)
+            self._dismissed_sig = dismissed_sig
+        wal_path = self.database.with_name(self.database.name + '-wal')
+        db_sig = (self._file_sig(self.database), self._file_sig(wal_path))
+        db_changed = db_sig != self._db_sig or self._db_sig is None
+        if db_changed:
+            with sqlite3.connect(f'file:{self.database}?mode=ro', uri=True, timeout=2) as connection:
+                has_receipts = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_read_receipts'").fetchone()
+                receipts = dict(connection.execute('SELECT thread_id, first_unread_turn FROM thread_read_receipts')) if has_receipts else {}
+                columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
+                updated = 'updated_at * 1000' if 'updated_at' in columns else '0'
+                if 'updated_at_ms' in columns:
+                    updated = f'COALESCE(updated_at_ms, {updated})'
+                filters = [
+                    "archived=0",
+                    "thread_source IN ('user','automation','agent_created_thread')",
+                    "attached_thread_parent_id IS NULL",
+                ]
+                if 'source' in columns:
+                    filters.append("(source IS NULL OR source NOT LIKE '{\"subagent\"%')")
+                if 'agent_path' in columns:
+                    filters.append("(agent_path IS NULL OR agent_path = '')")
+                rows = connection.execute(
+                    f"SELECT {updated}, id, COALESCE(NULLIF(name,''),title), cwd, rollout_path "
+                    f"FROM threads WHERE {' AND '.join(filters)}"
+                ).fetchall()
+            self._db_sig = db_sig
+            self._rows_cache = rows
+            self._receipts_cache = receipts
+            self._has_receipts = bool(has_receipts)
+        else:
+            rows = self._rows_cache
+            receipts = self._receipts_cache
+            has_receipts = self._has_receipts
+        journals_changed = False
         present = set()
         for updated, thread, title, cwd, filename in rows:
             present.add(thread)
@@ -168,9 +208,10 @@ class Monitor:
             signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
             previous = self.cache.get(thread)
             if previous and previous['signature'] == signature:
-                if thread in self.states:
+                if db_changed and thread in self.states:
                     self.states[thread].update(title=' '.join(title.split()), project=Path(cwd).name)
                 continue
+            journals_changed = True
             task = self.states.get(thread, {'id': thread, 'pending': {}}).copy()
             if previous and previous['inode'] == stat.st_ino and stat.st_size >= previous['offset']:
                 with path.open('rb') as handle:
@@ -195,10 +236,18 @@ class Monitor:
             task.update(title=' '.join(title.split()), project=Path(cwd).name)
             self.cache[thread] = {'signature': signature, 'inode': stat.st_ino, 'offset': offset}
             self.states[thread] = task
-        self.states = {key: task for key, task in self.states.items() if key in present}
-        for entry in self.history:
-            state = self.states.get(entry['id'], {})
-            entry.update(turn=state.get('turn', ''), status=state.get('status', 'stopped'))
+        self.changed = db_changed or journals_changed or dismissed_changed
+        if not self.changed and not publish:
+            return self._ordered_cache
+        if db_changed or journals_changed:
+            self.history = [dict(id=thread, title=' '.join((title or 'Codex 对话').split()),
+                                 project=Path(cwd or '').name, updated=(updated or 0) / 1000,
+                                 turn='', status='stopped')
+                            for updated, thread, title, cwd, filename in rows]
+            self.states = {key: task for key, task in self.states.items() if key in present}
+            for entry in self.history:
+                state = self.states.get(entry['id'], {})
+                entry.update(turn=state.get('turn', ''), status=state.get('status', 'stopped'))
         self.entries = {}
         for thread, task in self.states.items():
             status = task.get('status')
@@ -217,6 +266,7 @@ class Monitor:
             self.entries[thread] = task
         priority = {'waiting': 0, 'completed': 1, 'running': 2}
         ordered = sorted(self.entries.values(), key=lambda t: (priority.get(t['status'], 4), t['title']))
+        self._ordered_cache = ordered
         if not publish:
             return ordered
         tasks = [{key: task.get(key, '') for key in ('id', 'turn', 'title', 'status')} for task in ordered]

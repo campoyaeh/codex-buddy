@@ -10,6 +10,12 @@ if ! /usr/bin/python3 --version >/dev/null 2>&1; then
     exit 1
 fi
 if [[ -d Sources ]]; then
+    if [[ -z "${CODESIGN_IDENTITY:-}" ]] && ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq '"Codex Buddy Local Signing"'; then
+        if [[ -t 0 || "${SETUP_LOCAL_SIGNING:-0}" == "1" ]] && [[ -x ./scripts/setup-local-signing.sh ]]; then
+            print '首次安装：正在创建本机长期代码签名证书（仅需确认一次，后续更新不再丢失辅助功能权限）…'
+            ./scripts/setup-local-signing.sh || print -u2 '提示：跳过本地签名证书创建，将回退到临时签名。'
+        fi
+    fi
     ./scripts/build.sh
 fi
 bundle='工头喵.app'
@@ -23,7 +29,7 @@ app_stage=$(mktemp -d "$HOME/.codex/bin/.buddy-install.XXXXXX")
 trap 'rm -r "$app_stage"' EXIT
 ditto "build/$bundle" "$app_stage/$bundle"
 /usr/bin/codesign --verify --strict "$app_stage/$bundle"
-for source_file in codex-task-complete-popup task_monitor.py providers.py task_bridge.py integrations.py CodexTaskCompletePopup.m Celebration.h Celebration.m DesktopObserver.h DesktopObserver.m Mascot.h Mascot.m PanelTheme.h PanelTheme.m AntigravityNavigation.h AntigravityNavigation.m; do
+for source_file in codex-task-complete-popup task_monitor.py providers.py task_bridge.py integrations.py CodexTaskCompletePopup.m Celebration.h Celebration.m DesktopObserver.h DesktopObserver.m Mascot.h Mascot.m PanelTheme.h PanelTheme.m AntigravityNavigation.h AntigravityNavigation.m InputMirror.h InputMirror.m; do
     if [[ -f "$HOME/.codex/bin/$source_file" ]]; then
         cp "$HOME/.codex/bin/$source_file" "$backup_dir/"
     fi
@@ -68,6 +74,7 @@ if [[ -d Sources ]]; then
     cp Sources/Mascot.h Sources/Mascot.m "$HOME/.codex/bin/"
     cp Sources/PanelTheme.h Sources/PanelTheme.m "$HOME/.codex/bin/"
     cp Sources/AntigravityNavigation.h Sources/AntigravityNavigation.m "$HOME/.codex/bin/"
+    cp Sources/InputMirror.h Sources/InputMirror.m "$HOME/.codex/bin/"
     cp Sources/TaskPanel.m "$HOME/.codex/bin/CodexTaskCompletePopup.m"
 fi
 cat > "$app_stage/codex-task-complete-popup" <<'SH'

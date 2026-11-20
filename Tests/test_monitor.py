@@ -155,6 +155,29 @@ class MonitorTests(unittest.TestCase):
             for record in recovered: m.apply_record(task, record)
             self.assertEqual(task['status'], 'waiting')
 
+    def test_subagent_threads_are_excluded(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            log = root / 'rollout.jsonl'
+            log.write_text(json.dumps(event('task_started')) + '\n')
+            db = root / 'state.sqlite'
+            with sqlite3.connect(db) as connection:
+                connection.execute('CREATE TABLE threads (id,title,name,cwd,rollout_path,archived,thread_source,attached_thread_parent_id,source,agent_path)')
+                connection.executemany(
+                    'INSERT INTO threads VALUES (?,?,?,?,?,0,?,?,?,?)',
+                    [
+                        ('main', '主对话', '', '/project', str(log), 'user', None, 'vscode', None),
+                        ('sub-source', '子代理1', '', '/project', str(log), 'subagent', None, 'vscode', None),
+                        ('sub-attached', '子代理2', '', '/project', str(log), 'user', 'main', 'vscode', None),
+                        ('sub-json', '子代理3', '', '/project', str(log), 'user', None, '{"subagent":{"thread_spawn":{"parent_thread_id":"main"}}}', None),
+                        ('sub-path', '子代理4', '', '/project', str(log), 'user', None, 'vscode', '/root/worker'),
+                    ],
+                )
+            monitor = m.Monitor(root / 'data', db)
+            monitor.tick(publish=False)
+            self.assertEqual(set(monitor.entries), {'main'})
+            self.assertEqual([entry['id'] for entry in monitor.history], ['main'])
+
 
 if __name__ == '__main__':
     unittest.main()

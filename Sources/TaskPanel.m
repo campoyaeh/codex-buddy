@@ -1,11 +1,14 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <Carbon/Carbon.h>
 #import <sys/file.h>
 #import <unistd.h>
 #import "Celebration.h"
 #import "PanelTheme.h"
 #import "AntigravityNavigation.h"
+#import "InputMirror.h"
+#import "Updater.h"
 
 static NSString *DataDirectory(void) { return NSProcessInfo.processInfo.environment[@"TASK_PANEL_DATA_DIR"] ?: [NSHomeDirectory() stringByAppendingPathComponent:@".codex/task-manager"]; }
 static BOOL IsBuddyBundle(void) { return [NSBundle.mainBundle.bundleIdentifier isEqual:@"com.campoyaeh.codex-buddy"]; }
@@ -339,15 +342,42 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     return scroll;
 }
 
+@interface HoverPanelSurface : PanelSurface
+@property(nonatomic, copy) void (^onMouseEntered)(void);
+@property(nonatomic, copy) void (^onMouseExited)(void);
+@end
+@implementation HoverPanelSurface {
+    NSTrackingArea *_hoverArea;
+}
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (_hoverArea) [self removeTrackingArea:_hoverArea];
+    _hoverArea = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                              options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                                owner:self
+                                             userInfo:nil];
+    [self addTrackingArea:_hoverArea];
+}
+- (void)mouseEntered:(NSEvent *)event {
+    if (self.onMouseEntered) self.onMouseEntered();
+}
+- (void)mouseExited:(NSEvent *)event {
+    if (self.onMouseExited) self.onMouseExited();
+}
+@end
+
 @interface FloatingPanel : NSPanel
+@property BOOL allowKeyWindow;
 @end
 @implementation FloatingPanel
-- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeKeyWindow { return self.allowKeyWindow; }
 - (BOOL)canBecomeMainWindow { return NO; }
 @end
-@interface PanelController : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@interface PanelController : NSObject <NSApplicationDelegate, NSWindowDelegate, NSSearchFieldDelegate>
 @property(strong) FloatingPanel *panel;
 @property(strong) CelebrationController *celebration;
+@property(strong) InputMirrorController *inputMirror;
+@property(strong) AppUpdater *updater;
 @property(strong) NSStatusItem *statusItem;
 @property(strong) NSTask *monitor;
 @property(strong) NSTimer *timer;
@@ -355,8 +385,16 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
 @property(copy) NSArray *history;
 @property BOOL showingHistory;
 @property NSUInteger historyLimit;
+@property(copy) NSString *historyQuery;
+@property(strong) NSSearchField *historySearchField;
 @property(copy) NSString *signature;
+@property(strong) NSNumber *lastSnapshotInode;
+@property(strong) NSNumber *lastSnapshotSize;
+@property(strong) NSDate *lastDismissedMtime;
 @property(copy) NSString *monitorError;
+@property(copy) NSString *toastMessage;
+@property BOOL toastIsError;
+@property(strong) NSTimer *toastTimer;
 @property BOOL collapsed;
 @property BOOL preview;
 @property BOOL launchedInteractively;
@@ -371,13 +409,41 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
 @property(copy) NSString *sourcesSignature;
 @property(weak) NSButton *floatingVisibilityButton;
 @property(weak) NSButton *launchAtLoginButton;
+@property(weak) NSButton *accessibilityButton;
+@property(weak) NSButton *integrationsAccessibilityButton;
+@property(weak) NSButton *updateCheckButton;
 @property BOOL navigatingAntigravity;
 @property(copy) NSString *antigravityNotice;
 @property BOOL antigravityNeedsPermission;
+@property(strong) NSTimer *autoCollapseTimer;
+@property BOOL pointerInsidePanel;
+@property NSTimeInterval autoCollapseDelay;
+@property NSTimeInterval hoverExitCollapseDelay;
+@property EventHotKeyRef mirrorHotKeyRef;
+@property EventHandlerRef mirrorHotKeyHandler;
 - (void)refresh;
 - (void)rebuild;
 - (void)updateStatusItemVisibility;
+- (BOOL)isAutoCollapseEnabled;
+- (BOOL)isDoNotDisturbEnabled;
+- (void)showToast:(NSString *)message isError:(BOOL)isError duration:(NSTimeInterval)duration;
+- (void)panelPointerDidEnter;
+- (void)panelPointerDidExit;
+- (void)scheduleAutoCollapseTimer;
+- (void)scheduleAutoCollapseAfterDelay:(NSTimeInterval)delay;
+- (void)cancelAutoCollapseTimer;
+- (void)toggleInputMirrorFromMenu:(id)sender;
 @end
+
+static OSStatus MirrorHotKeyCallback(EventHandlerCallRef nextHandler, EventRef theEvent, void *userData) {
+    PanelController *controller = (__bridge PanelController *)userData;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [controller toggleInputMirrorFromMenu:nil];
+        BOOL enabled = [controller.celebration.settings[@"inputMirrorEnabled"] boolValue];
+        [controller showToast:enabled ? @"已开启全局输入镜像（⌥⌘M）" : @"已关闭全局输入镜像（⌥⌘M）" isError:NO duration:2.2];
+    });
+    return noErr;
+}
 @implementation PanelController
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
@@ -386,15 +452,48 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     self.dismissed = [ReadJSON(@"dismissed.json") mutableCopy] ?: [NSMutableDictionary dictionary];
     self.collapsed = YES;
     self.historyLimit = 10;
+    self.autoCollapseDelay = 10.0;
+    self.hoverExitCollapseDelay = 1.0;
     self.celebration = [[CelebrationController alloc] initWithDirectory:DataDirectory()];
     [self.celebration applyTheme];
+    self.inputMirror = [[InputMirrorController alloc] init];
+    self.inputMirror.previewMode = self.preview;
+    self.inputMirror.style = (InputMirrorStyle)[self.celebration.settings[@"inputMirrorStyle"] integerValue];
+    self.inputMirror.excludeIDEs = [self.celebration.settings[@"inputMirrorExcludeIDEs"] boolValue];
+    self.inputMirror.enabled = [self.celebration.settings[@"inputMirrorEnabled"] boolValue];
+    self.updater = [[AppUpdater alloc] init];
     __weak PanelController *weakSelf = self;
+    self.updater.onStatusChange = ^(NSString *status) {
+        if (weakSelf.celebration.saveStatus) weakSelf.celebration.saveStatus.stringValue = status;
+        if (weakSelf.updater.latestVersion.length && UpdaterCompareVersions(weakSelf.updater.latestVersion, UpdaterCurrentVersion()) == NSOrderedDescending) {
+            weakSelf.updateCheckButton.title = [NSString stringWithFormat:@"更新至 v%@", weakSelf.updater.latestVersion];
+            weakSelf.updateCheckButton.contentTintColor = NSColor.systemBlueColor;
+        }
+    };
     self.celebration.settingDidChange = ^(NSString *key) {
         if ([key isEqual:@"showStatusItem"]) [weakSelf updateStatusItemVisibility];
-        if ([key isEqual:@"mascotID"] || [key isEqual:@"theme"]) [weakSelf rebuild];
+        if ([key isEqual:@"mascotID"] || [key isEqual:@"theme"] || [key isEqual:@"doNotDisturb"]) [weakSelf rebuild];
+        if ([key isEqual:@"inputMirrorEnabled"]) [weakSelf applyInputMirrorSettingFromUser:YES];
+        if ([key isEqual:@"inputMirrorExcludeIDEs"]) {
+            weakSelf.inputMirror.excludeIDEs = [weakSelf.celebration.settings[@"inputMirrorExcludeIDEs"] boolValue];
+        }
+        if ([key isEqual:@"inputMirrorStyle"]) {
+            weakSelf.inputMirror.style = (InputMirrorStyle)[weakSelf.celebration.settings[@"inputMirrorStyle"] integerValue];
+            if (!weakSelf.preview) [weakSelf.inputMirror showPreviewSample];
+        }
+        if ([key isEqual:@"autoCollapsePanel"]) [weakSelf applyAutoCollapseSetting];
+    };
+    self.celebration.previewInputMirror = ^{
+        [weakSelf.inputMirror showPreviewSample];
+    };
+    self.celebration.resetInputMirrorPosition = ^{
+        [weakSelf.inputMirror resetSavedPosition];
+        if (!weakSelf.preview) [weakSelf.inputMirror showPreviewSample];
+        if (weakSelf.celebration.saveStatus) weakSelf.celebration.saveStatus.stringValue = @"输入镜像浮窗位置已重置";
     };
     self.panel = [[FloatingPanel alloc] initWithContentRect:NSMakeRect(0,0,360,80)
         styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel backing:NSBackingStoreBuffered defer:NO];
+    self.panel.becomesKeyOnlyIfNeeded = YES;
     self.panel.delegate = self;
     self.panel.level = NSFloatingWindowLevel;
     self.panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
@@ -440,6 +539,38 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     }
     self.timer = [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(screenChanged:) name:NSApplicationDidChangeScreenParametersNotification object:nil];
+    if (!self.preview) {
+        [self registerMirrorHotKey];
+        // Silent background update check at most once every 24 hours
+        NSTimeInterval lastCheck = [NSUserDefaults.standardUserDefaults doubleForKey:@"LastUpdateCheckTime"];
+        if (NSDate.date.timeIntervalSince1970 - lastCheck > 86400) {
+            [NSUserDefaults.standardUserDefaults setDouble:NSDate.date.timeIntervalSince1970 forKey:@"LastUpdateCheckTime"];
+            [self.updater checkForUpdatesInteractive:NO completion:nil];
+        }
+    }
+}
+- (void)registerMirrorHotKey {
+    EventTypeSpec spec = { kEventClassKeyboard, kEventHotKeyPressed };
+    EventHandlerRef handler = NULL;
+    if (InstallApplicationEventHandler(&MirrorHotKeyCallback, 1, &spec, (__bridge void *)self, &handler) == noErr) {
+        self.mirrorHotKeyHandler = handler;
+        EventHotKeyID hotKeyID = { 'CBIM', 1 };
+        EventHotKeyRef ref = NULL;
+        // Option + Command + M
+        if (RegisterEventHotKey(kVK_ANSI_M, cmdKey | optionKey, hotKeyID, GetApplicationEventTarget(), 0, &ref) == noErr) {
+            self.mirrorHotKeyRef = ref;
+        }
+    }
+}
+- (void)unregisterMirrorHotKey {
+    if (self.mirrorHotKeyRef) {
+        UnregisterEventHotKey(self.mirrorHotKeyRef);
+        self.mirrorHotKeyRef = NULL;
+    }
+    if (self.mirrorHotKeyHandler) {
+        RemoveEventHandler(self.mirrorHotKeyHandler);
+        self.mirrorHotKeyHandler = NULL;
+    }
 }
 - (void)startMonitor {
     NSString *directory = PanelScriptsDirectory();
@@ -450,9 +581,34 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     if (![self.monitor launchAndReturnError:&error]) self.monitorError = error.localizedDescription;
 }
 - (void)refresh {
-    if (self.integrationsWindow.visible) [self updateIntegrations];
+    if (self.integrationsWindow.visible) {
+        [self updateIntegrations];
+        [self updateAccessibilityButtons];
+    }
+    if (self.celebration.settingsWindow.visible) {
+        [self applyInputMirrorSettingFromUser:NO];
+        [self updateAccessibilityButtons];
+    }
     if (self.preview || self.removingTasks.count) return;
     if (self.monitor && !self.monitor.running) [self startMonitor];
+    NSString *snapshotPath = [DataDirectory() stringByAppendingPathComponent:@"snapshot.json"];
+    NSString *dismissedPath = [DataDirectory() stringByAppendingPathComponent:@"dismissed.json"];
+    NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:snapshotPath error:NULL];
+    NSDictionary *dismissedAttrs = [NSFileManager.defaultManager attributesOfItemAtPath:dismissedPath error:NULL];
+    BOOL snapshotStale = (!attrs || [attrs.fileModificationDate timeIntervalSinceNow] < -8);
+    NSNumber *inode = attrs[NSFileSystemFileNumber];
+    NSNumber *fileSize = attrs[NSFileSize];
+    NSDate *dismissedMtime = dismissedAttrs.fileModificationDate;
+    // Fast path: skip parsing large snapshot.json when only heartbeat mtime changed
+    if (self.signature && !snapshotStale && !self.monitorError.length &&
+        inode && [inode isEqual:self.lastSnapshotInode] &&
+        fileSize && [fileSize isEqual:self.lastSnapshotSize] &&
+        ((!dismissedMtime && !self.lastDismissedMtime) || [dismissedMtime isEqual:self.lastDismissedMtime])) {
+        return;
+    }
+    self.lastSnapshotInode = inode;
+    self.lastSnapshotSize = fileSize;
+    self.lastDismissedMtime = dismissedMtime;
     NSDictionary *snapshot = ReadJSON(@"snapshot.json");
     NSArray *incoming = [snapshot[@"tasks"] isKindOfClass:NSArray.class] ? snapshot[@"tasks"] : @[];
     NSArray *history = [snapshot[@"history"] isKindOfClass:NSArray.class] ? snapshot[@"history"] : @[];
@@ -462,9 +618,8 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         BOOL dismissed = [self.dismissed[task[@"id"]] isEqual:DismissalKey(task)];
         if (active && !dismissed) [tasks addObject:task];
     }
-    NSString *error = snapshot[@"error"] ?: self.monitorError ?: @"";
-    NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:[DataDirectory() stringByAppendingPathComponent:@"snapshot.json"] error:NULL];
-    if (!snapshot || [attrs.fileModificationDate timeIntervalSinceNow] < -8) error = @"正在连接任务状态…";
+    NSString *error = snapshot[@"error"] ?: @"";
+    if (!snapshot || snapshotStale) error = @"正在连接任务状态…";
     NSData *data = [NSJSONSerialization dataWithJSONObject:@[tasks,history,error] options:NSJSONWritingSortedKeys error:NULL];
     NSString *signature = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if ([self.signature isEqual:signature]) return;
@@ -486,15 +641,29 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         }
         if (!known) hasNewActivity = YES;
     }
-    if (!tasks.count && !self.showingHistory) self.collapsed = YES;
-    else if (!hadTasks || hasNewActivity) self.collapsed = NO;
+    BOOL dnd = [self isDoNotDisturbEnabled];
+    BOOL autoCollapse = [self isAutoCollapseEnabled];
+    if (autoCollapse) {
+        if (!self.signature) {
+            self.collapsed = YES;
+        } else if (!tasks.count && !self.showingHistory) {
+            self.collapsed = YES;
+            [self cancelAutoCollapseTimer];
+        } else if (hasNewActivity && !dnd) {
+            self.collapsed = NO;
+            [self scheduleAutoCollapseTimer];
+        }
+    } else {
+        if (!tasks.count && !self.showingHistory) self.collapsed = YES;
+        else if ((!hadTasks || hasNewActivity) && !dnd) self.collapsed = NO;
+    }
     self.animateResize = self.signature != nil;
     self.signature = signature;
     self.tasks = tasks;
     self.history = history;
     self.monitorError = error;
     [self rebuild];
-    if (self.completionPulse) [self.celebration showOnScreen:self.panel.screen ?: NSScreen.mainScreen];
+    if (self.completionPulse && !dnd) [self.celebration showOnScreen:self.panel.screen ?: NSScreen.mainScreen];
     self.animateResize = NO;
     self.completionPulse = NO;
 }
@@ -523,8 +692,133 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
 - (NSMenu *)statusMenu {
     NSMenu *menu = [NSMenu new];
     [menu addItemWithTitle:@"进入主面板" action:@selector(showMainPanel:) keyEquivalent:@""].target = self;
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *collapseItem = [menu addItemWithTitle:@"单屏自动收起" action:@selector(toggleAutoCollapseFromMenu:) keyEquivalent:@""];
+    collapseItem.target = self;
+    collapseItem.state = [self isAutoCollapseEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *mirrorItem = [menu addItemWithTitle:@"全局输入镜像（⌥⌘M）" action:@selector(toggleInputMirrorFromMenu:) keyEquivalent:@""];
+    mirrorItem.target = self;
+    mirrorItem.state = [self.celebration.settings[@"inputMirrorEnabled"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *dndItem = [menu addItemWithTitle:@"勿扰模式（暂停庆祝与弹出）" action:@selector(toggleDoNotDisturbFromMenu:) keyEquivalent:@""];
+    dndItem.target = self;
+    dndItem.state = [self isDoNotDisturbEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItemWithTitle:@"检查更新…" action:@selector(checkForUpdates:) keyEquivalent:@""].target = self;
     [menu addItemWithTitle:@"退出应用" action:@selector(quitApplication:) keyEquivalent:@""].target = self;
     return menu;
+}
+- (BOOL)isDoNotDisturbEnabled {
+    return [self.celebration.settings[@"doNotDisturb"] boolValue];
+}
+- (void)toggleDoNotDisturbFromMenu:(id)sender {
+    BOOL next = ![self isDoNotDisturbEnabled];
+    self.celebration.settings[@"doNotDisturb"] = @(next);
+    [self.celebration saveChange:@"doNotDisturb"];
+    [self showToast:next ? @"已开启勿扰模式（暂停庆祝与自动弹出）" : @"已关闭勿扰模式" isError:NO duration:2.4];
+}
+- (void)checkForUpdates:(id)sender {
+    [self.updater checkForUpdatesInteractive:YES completion:nil];
+}
+- (void)showToast:(NSString *)message isError:(BOOL)isError duration:(NSTimeInterval)duration {
+    [self.toastTimer invalidate];
+    self.toastTimer = nil;
+    self.toastMessage = message;
+    self.toastIsError = isError;
+    [self rebuild];
+    if (duration > 0) {
+        __weak PanelController *weakSelf = self;
+        self.toastTimer = [NSTimer scheduledTimerWithTimeInterval:duration repeats:NO block:^(NSTimer *timer) {
+            PanelController *owner = weakSelf;
+            if (!owner) return;
+            owner.toastMessage = nil;
+            owner.toastIsError = NO;
+            owner.toastTimer = nil;
+            [owner rebuild];
+        }];
+    }
+}
+- (BOOL)isAutoCollapseEnabled {
+    return [self.celebration.settings[@"autoCollapsePanel"] boolValue];
+}
+- (void)toggleAutoCollapseFromMenu:(id)sender {
+    BOOL next = ![self isAutoCollapseEnabled];
+    self.celebration.settings[@"autoCollapsePanel"] = @(next);
+    self.celebration.autoCollapseCheckbox.state = next ? NSControlStateValueOn : NSControlStateValueOff;
+    [self.celebration saveChange:@"autoCollapsePanel"];
+}
+- (void)applyAutoCollapseSetting {
+    if (![self isAutoCollapseEnabled]) {
+        [self cancelAutoCollapseTimer];
+        return;
+    }
+    if (!self.pointerInsidePanel && !self.collapsed) {
+        self.collapsed = YES;
+        self.animateResize = !self.preview;
+        [self rebuild];
+        self.animateResize = NO;
+    }
+}
+- (void)cancelAutoCollapseTimer {
+    [self.autoCollapseTimer invalidate];
+    self.autoCollapseTimer = nil;
+}
+- (void)scheduleAutoCollapseTimer {
+    NSTimeInterval delay = self.autoCollapseDelay > 0 ? self.autoCollapseDelay : 10.0;
+    [self scheduleAutoCollapseAfterDelay:delay];
+}
+- (void)scheduleAutoCollapseAfterDelay:(NSTimeInterval)delay {
+    [self cancelAutoCollapseTimer];
+    if (![self isAutoCollapseEnabled] || self.pointerInsidePanel || self.collapsed) return;
+    __weak PanelController *weakSelf = self;
+    self.autoCollapseTimer = [NSTimer timerWithTimeInterval:delay repeats:NO block:^(NSTimer *timer) {
+        PanelController *owner = weakSelf;
+        if (!owner || ![owner isAutoCollapseEnabled] || owner.pointerInsidePanel || owner.collapsed) return;
+        owner.collapsed = YES;
+        owner.animateResize = !owner.preview;
+        [owner rebuild];
+        owner.animateResize = NO;
+    }];
+    [NSRunLoop.mainRunLoop addTimer:self.autoCollapseTimer forMode:NSRunLoopCommonModes];
+}
+- (void)panelPointerDidEnter {
+    self.pointerInsidePanel = YES;
+    [self cancelAutoCollapseTimer];
+    if ([self isAutoCollapseEnabled] && self.collapsed) {
+        self.collapsed = NO;
+        self.animateResize = !self.preview;
+        [self rebuild];
+        self.animateResize = NO;
+    }
+}
+- (void)panelPointerDidExit {
+    self.pointerInsidePanel = NO;
+    if ([self isAutoCollapseEnabled] && !self.collapsed) {
+        NSTimeInterval exitDelay = self.hoverExitCollapseDelay > 0 ? self.hoverExitCollapseDelay : 1.0;
+        [self scheduleAutoCollapseAfterDelay:exitDelay];
+    }
+}
+- (void)toggleInputMirrorFromMenu:(id)sender {
+    BOOL next = ![self.celebration.settings[@"inputMirrorEnabled"] boolValue];
+    self.celebration.settings[@"inputMirrorEnabled"] = @(next);
+    self.celebration.inputMirrorCheckbox.state = next ? NSControlStateValueOn : NSControlStateValueOff;
+    [self.celebration saveChange:@"inputMirrorEnabled"];
+}
+- (void)applyInputMirrorSettingFromUser:(BOOL)fromUser {
+    BOOL enabled = [self.celebration.settings[@"inputMirrorEnabled"] boolValue];
+    self.inputMirror.enabled = enabled;
+    if (!enabled) {
+        self.celebration.inputMirrorHint.stringValue = @"已关闭 · 开启后仅对已支持的 AI 应用输入框生效";
+        return;
+    }
+    if (!self.preview && !AXIsProcessTrusted()) {
+        if (fromUser) {
+            NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
+            AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+        }
+        self.celebration.inputMirrorHint.stringValue = @"需在「系统设置 → 隐私与安全性 → 辅助功能」勾选工头喵后生效";
+    } else {
+        self.celebration.inputMirrorHint.stringValue = @"已开启 · 仅对已支持的 AI 应用输入框生效，支持跨屏拖动记忆";
+    }
 }
 - (void)statusClicked:(id)sender {
     if (NSApp.currentEvent.type == NSEventTypeRightMouseUp) {
@@ -533,45 +827,86 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     }
     [self showMainPanel:sender];
 }
+- (void)updateAccessibilityButtons {
+    BOOL trusted = AXIsProcessTrusted();
+    NSString *title = trusted ? @"辅助功能 · 已授权" : @"辅助功能 · 未授权";
+    NSColor *tint = trusted ? NSColor.systemGreenColor : NSColor.systemOrangeColor;
+    if (self.accessibilityButton) {
+        self.accessibilityButton.title = title;
+        self.accessibilityButton.contentTintColor = tint;
+    }
+    if (self.integrationsAccessibilityButton) {
+        self.integrationsAccessibilityButton.title = title;
+        self.integrationsAccessibilityButton.contentTintColor = tint;
+    }
+}
 - (void)addMainPanelActions {
     if (self.floatingVisibilityButton) return;
     NSView *root = self.celebration.settingsWindow.contentView;
-    NSButton *antigravity = [NSButton buttonWithTitle:@"任务跳转授权" target:self action:@selector(requestAntigravityAccess:)];
-    antigravity.toolTip = @"在系统设置中允许「工头喵」自动打开 Antigravity 会话";
-    antigravity.frame = NSMakeRect(256,708,170,32);
-    [root addSubview:antigravity];
-    NSButton *floating = [NSButton buttonWithTitle:@"显示任务浮窗" target:self action:@selector(toggleVisible:)];
-    floating.frame = NSMakeRect(434,708,120,32);
-    [root addSubview:floating];
-    self.floatingVisibilityButton = floating;
-    NSButton *history = [NSButton buttonWithTitle:@"历史对话" target:self action:@selector(showHistory:)];
-    history.frame = NSMakeRect(562,708,92,32);
-    [root addSubview:history];
+    // Top-right persistent utility actions (visible across all tabs)
+    // Add extra gap before "退出应用" and tint it red so users don't misclick quit.
     NSButton *integrations = [NSButton buttonWithTitle:@"兼容与接入" target:self action:@selector(showIntegrations:)];
-    integrations.frame = NSMakeRect(662,708,112,32);
+    integrations.frame = NSMakeRect(442,508,100,28);
     [root addSubview:integrations];
+    NSButton *history = [NSButton buttonWithTitle:@"历史对话" target:self action:@selector(showHistory:)];
+    history.frame = NSMakeRect(548,508,86,28);
+    [root addSubview:history];
     NSButton *quit = [NSButton buttonWithTitle:@"退出应用" target:self action:@selector(quitApplication:)];
-    quit.frame = NSMakeRect(782,708,90,32);
+    quit.frame = NSMakeRect(666,508,90,28);
+    quit.contentTintColor = NSColor.systemRedColor;
     [root addSubview:quit];
+
+    // Bottom-right version & update check (visible across all tabs)
+    NSTextField *versionLabel = [NSTextField labelWithString:[NSString stringWithFormat:@"v%@", UpdaterCurrentVersion()]];
+    versionLabel.font = [NSFont systemFontOfSize:11.5];
+    versionLabel.textColor = NSColor.tertiaryLabelColor;
+    versionLabel.alignment = NSTextAlignmentRight;
+    versionLabel.frame = NSMakeRect(548, 18, 96, 18);
+    [root addSubview:versionLabel];
+    NSButton *updateBtn = [NSButton buttonWithTitle:@"检查更新" target:self action:@selector(checkForUpdates:)];
+    updateBtn.bezelStyle = NSBezelStyleRounded;
+    updateBtn.controlSize = NSControlSizeSmall;
+    updateBtn.frame = NSMakeRect(652, 15, 104, 24);
+    [root addSubview:updateBtn];
+    self.updateCheckButton = updateBtn;
+
+    // Tab 0 (伙伴与外观) — Row 2 right: Floating task panel visibility
+    NSButton *floating = [NSButton buttonWithTitle:@"显示任务浮窗" target:self action:@selector(toggleVisible:)];
+    floating.frame = NSMakeRect(592,119,144,28);
+    [root addSubview:floating];
+    [self.celebration registerTabView:floating forTab:0];
+    self.floatingVisibilityButton = floating;
+
+    // Tab 0 (伙伴与外观) — Row 3 right: Launch at login + Accessibility permission
     NSButton *launchAtLogin = [NSButton checkboxWithTitle:@"登录时自动启动" target:self action:@selector(toggleLaunchAtLogin:)];
-    launchAtLogin.frame = NSMakeRect(326,93,150,22);
+    launchAtLogin.frame = NSMakeRect(384,70,194,22);
     launchAtLogin.state = IsLaunchAtLoginEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
     [root addSubview:launchAtLogin];
+    [self.celebration registerTabView:launchAtLogin forTab:0];
     self.launchAtLoginButton = launchAtLogin;
+
+    NSButton *antigravity = [NSButton buttonWithTitle:@"辅助功能授权" target:self action:@selector(requestAntigravityAccess:)];
+    antigravity.toolTip = @"在系统设置中允许「工头喵」使用辅助功能（Antigravity 跳转与全局输入镜像）";
+    antigravity.frame = NSMakeRect(592,67,144,28);
+    [root addSubview:antigravity];
+    [self.celebration registerTabView:antigravity forTab:0];
+    self.accessibilityButton = antigravity;
+    [self updateAccessibilityButtons];
 }
 - (void)toggleLaunchAtLogin:(NSButton *)sender {
     BOOL enable = sender.state == NSControlStateValueOn;
     NSError *error = nil;
     if (!SetLaunchAtLoginEnabled(enable, &error)) {
         sender.state = enable ? NSControlStateValueOff : NSControlStateValueOn;
-        self.monitorError = error.localizedDescription ?: @"更新登录自启动设置失败";
-        [self rebuild];
+        [self showToast:error.localizedDescription ?: @"更新登录自启动设置失败" isError:YES duration:3.0];
     }
 }
 - (void)showMainPanel:(id)sender {
     [self.celebration showSettings:sender];
     [self addMainPanelActions];
     [self updateFloatingVisibilityButton];
+    [self updateAccessibilityButtons];
+    [self applyInputMirrorSettingFromUser:NO];
 }
 - (void)quitApplication:(id)sender { [NSApp terminate:sender]; }
 - (void)updateFloatingVisibilityButton {
@@ -602,16 +937,41 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
 - (void)showListWithHistory:(BOOL)showHistory {
     self.showingHistory = showHistory;
     self.historyLimit = 10;
+    if (!showHistory) {
+        self.historyQuery = @"";
+        self.historySearchField.stringValue = @"";
+    }
     self.collapsed = NO;
     [self rebuild];
+}
+- (NSArray *)filteredHistory {
+    NSString *q = [self.historyQuery stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].lowercaseString;
+    if (!q.length) return self.history ?: @[];
+    NSMutableArray *matches = [NSMutableArray array];
+    for (NSDictionary *entry in self.history) {
+        NSString *title = [entry[@"title"] isKindOfClass:NSString.class] ? [entry[@"title"] lowercaseString] : @"";
+        NSString *project = [entry[@"project"] isKindOfClass:NSString.class] ? [entry[@"project"] lowercaseString] : @"";
+        NSString *source = [entry[@"source"] isKindOfClass:NSString.class] ? [entry[@"source"] lowercaseString] : @"";
+        NSString *provider = [entry[@"provider"] isKindOfClass:NSString.class] ? [entry[@"provider"] lowercaseString] : @"";
+        if ([title containsString:q] || [project containsString:q] || [source containsString:q] || [provider containsString:q]) {
+            [matches addObject:entry];
+        }
+    }
+    return matches;
+}
+- (void)controlTextDidChange:(NSNotification *)obj {
+    if (obj.object == self.historySearchField) {
+        self.historyQuery = self.historySearchField.stringValue ?: @"";
+        self.historyLimit = 10;
+        [self rebuild];
+    }
 }
 - (void)loadMoreHistory:(id)sender {
     self.historyLimit += 10;
     [self rebuild];
 }
 - (void)showNavigationError:(NSString *)message {
-    self.monitorError = message;
-    [self rebuild];
+    [self showToast:message isError:YES duration:3.0];
 }
 
 - (void)showAntigravityNotice:(NSString *)message permission:(BOOL)permission {
@@ -711,6 +1071,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     NSDictionary *task = nil;
     for (NSDictionary *entry in self.showingHistory ? self.history : self.tasks) if ([entry[@"id"] isEqual:sender.threadID]) task = entry;
     if (!task) return;
+    [self.inputMirror suppressAutoPopupUntilNextClick];
     if (!self.preview && [task[@"provider"] isEqual:@"antigravity"]) {
         [self openAntigravityTask:task row:sender.superview];
         return;
@@ -759,9 +1120,8 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
             NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
             [pasteboard clearContents];
             [pasteboard setString:task[@"resume_command"] forType:NSPasteboardTypeString];
-            self.monitorError = @"已复制会话恢复命令，请粘贴到终端运行";
+            [self showToast:@"已复制会话恢复命令，请粘贴到终端运行" isError:NO duration:2.8];
             [self finishOpeningTask:task row:sender.superview opened:YES];
-            if (!self.removingTasks.count) [self rebuild];
             return;
         }
     }
@@ -792,6 +1152,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
 - (void)copyResume:(NSMenuItem *)sender {
     [NSPasteboard.generalPasteboard clearContents];
     [NSPasteboard.generalPasteboard setString:sender.representedObject forType:NSPasteboardTypeString];
+    [self showToast:@"已复制会话恢复命令" isError:NO duration:2.2];
 }
 - (void)showIntegrations:(id)sender {
     if (!self.integrationsWindow) {
@@ -806,19 +1167,69 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     [self.integrationsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 }
+static NSInteger SourceSortRank(NSDictionary *source) {
+    NSString *state = source[@"state"] ?: @"";
+    if ([@[@"已连接", @"已收到任务"] containsObject:state]) return 0;
+    if ([state hasPrefix:@"已配置"] || [source[@"error"] length] || [source[@"setup_error"] length]) return 1;
+    if ([state hasPrefix:@"已安装"]) return 2;
+    if ([state isEqual:@"已屏蔽"]) return 3;
+    return 4;
+}
+- (void)toggleHideUninstalledSources:(NSButton *)sender {
+    self.celebration.settings[@"hideUninstalledSources"] = @(sender.state == NSControlStateValueOn);
+    [self.celebration saveChange:@"hideUninstalledSources"];
+    self.sourcesSignature = nil;
+    [self updateIntegrations];
+}
+- (void)toggleProviderEnabled:(NSButton *)sender {
+    NSString *providerID = sender.identifier;
+    if (!providerID.length) return;
+    NSMutableArray *disabled = [NSMutableArray arrayWithArray:[self.celebration.settings[@"disabledProviders"] isKindOfClass:NSArray.class] ? self.celebration.settings[@"disabledProviders"] : @[]];
+    BOOL enabled = sender.state == NSControlStateValueOn;
+    if (enabled) [disabled removeObject:providerID];
+    else if (![disabled containsObject:providerID]) [disabled addObject:providerID];
+    self.celebration.settings[@"disabledProviders"] = disabled;
+    [self.celebration saveChange:@"disabledProviders"];
+    self.sourcesSignature = nil;
+    [self updateIntegrations];
+}
 - (void)updateIntegrations {
     NSDictionary *snapshot = ReadJSON(@"snapshot.json");
-    NSArray *sources = snapshot[@"sources"] ?: @[];
-    NSString *signature = [sources description];
+    NSArray *rawSources = snapshot[@"sources"] ?: @[];
+    BOOL hideUninstalled = [self.celebration.settings[@"hideUninstalledSources"] boolValue];
+    NSArray *disabledList = [self.celebration.settings[@"disabledProviders"] isKindOfClass:NSArray.class] ? self.celebration.settings[@"disabledProviders"] : @[];
+    NSString *signature = [NSString stringWithFormat:@"%@|%d|%@", [rawSources description], hideUninstalled, [disabledList description]];
     if ([signature isEqual:self.sourcesSignature]) return;
     self.sourcesSignature = signature;
+
+    NSInteger activeCount = 0;
+    for (NSDictionary *source in rawSources) {
+        NSString *st = source[@"state"] ?: @"";
+        if ([@[@"已连接", @"已收到任务"] containsObject:st] || [st hasPrefix:@"已配置"]) activeCount++;
+    }
+    NSArray *sortedSources = [rawSources sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSInteger ra = SourceSortRank(a), rb = SourceSortRank(b);
+        if (ra != rb) return ra < rb ? NSOrderedAscending : NSOrderedDescending;
+        return [(a[@"name"] ?: @"") compare:(b[@"name"] ?: @"")];
+    }];
+    NSMutableArray *sources = [NSMutableArray array];
+    for (NSDictionary *source in sortedSources) {
+        if (hideUninstalled && [source[@"state"] isEqual:@"未检测到客户端"]) continue;
+        [sources addObject:source];
+    }
+
     PanelSurface *root = [[PanelSurface alloc] initWithFrame:NSMakeRect(0,0,720,650)];
     root.fillColor = PanelColor(0xf7f8fb,0x171a1f,1);
     self.integrationsWindow.contentView = root;
     NSTextField *title = Label(@"让不同 AI 助手的任务汇集到同一个浮窗",18,NSColor.labelColor);
     title.font = [NSFont systemFontOfSize:18 weight:NSFontWeightSemibold];
-    title.frame = NSMakeRect(22,602,676,28); [root addSubview:title];
-    NSTextField *help = Label(@"配置事件接入后，请在对应客户端开启新会话。",11,NSColor.secondaryLabelColor);
+    title.frame = NSMakeRect(22,602,520,28); [root addSubview:title];
+    NSButton *hideToggle = [NSButton checkboxWithTitle:@"隐藏未安装客户端" target:self action:@selector(toggleHideUninstalledSources:)];
+    hideToggle.frame = NSMakeRect(558,604,142,22);
+    hideToggle.state = hideUninstalled ? NSControlStateValueOn : NSControlStateValueOff;
+    [root addSubview:hideToggle];
+    NSString *summary = [NSString stringWithFormat:@"已接入 %ld / %lu 款助手 · 配置事件接入后，请在对应客户端开启新会话（取消勾选可屏蔽该端任务）。", (long)activeCount, (unsigned long)rawSources.count];
+    NSTextField *help = Label(summary,11,NSColor.secondaryLabelColor);
     help.frame = NSMakeRect(22,575,676,24); [root addSubview:help];
     NSScrollView *scroll = PanelScrollView(NSMakeRect(18,124,684,440), MAX(440,sources.count*38));
     NSView *document = scroll.documentView;
@@ -826,23 +1237,34 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     NSInteger index = 0;
     for (NSDictionary *source in sources) {
         CGFloat y = (index++) * 38;
+        NSString *providerID = source[@"id"] ?: @"";
+        BOOL isDisabled = [disabledList containsObject:providerID] || [source[@"disabled"] boolValue];
+        NSButton *toggle = [NSButton checkboxWithTitle:@"" target:self action:@selector(toggleProviderEnabled:)];
+        toggle.identifier = providerID;
+        toggle.state = isDisabled ? NSControlStateValueOff : NSControlStateValueOn;
+        toggle.toolTip = isDisabled ? @"已屏蔽该客户端的任务提醒，勾选以恢复" : @"取消勾选可单独屏蔽该客户端的任务提醒";
+        toggle.frame = NSMakeRect(4,y+9,20,20);
+        [document addSubview:toggle];
         BOOL connected = [@[@"已连接",@"已收到任务"] containsObject:source[@"state"]];
-        NSColor *color = [source[@"error"] length] || [source[@"setup_error"] length] ? NSColor.systemOrangeColor : (connected ? NSColor.systemGreenColor : ([source[@"state"] hasPrefix:@"已配置"] ? NSColor.systemBlueColor : NSColor.secondaryLabelColor));
-        NSTextField *name = Label(source[@"name"],12,NSColor.labelColor);
-        name.frame = NSMakeRect(6,y,218,38); [document addSubview:name];
-        NSTextField *state = Label(source[@"state"],11,color);
-        state.frame = NSMakeRect(228,y,260,38);
+        NSColor *color = isDisabled ? NSColor.tertiaryLabelColor : ([source[@"error"] length] || [source[@"setup_error"] length] ? NSColor.systemOrangeColor : (connected ? NSColor.systemGreenColor : ([source[@"state"] hasPrefix:@"已配置"] ? NSColor.systemBlueColor : NSColor.secondaryLabelColor)));
+        NSTextField *name = Label(source[@"name"],12,isDisabled ? NSColor.tertiaryLabelColor : NSColor.labelColor);
+        name.frame = NSMakeRect(28,y,204,38); [document addSubview:name];
+        NSString *displayState = isDisabled ? @"已屏蔽" : (source[@"state"] ?: @"");
+        NSTextField *state = Label(displayState,11,color);
+        state.frame = NSMakeRect(236,y,252,38);
         state.toolTip = [NSString stringWithFormat:@"%@\n%@\n%@",source[@"detail"] ?: @"",source[@"error"] ?: @"",source[@"setup_error"] ?: @""];
         [document addSubview:state];
         NSTextField *mode = Label(source[@"mode"],11,NSColor.tertiaryLabelColor);
         mode.frame = NSMakeRect(490,y,174,38); [document addSubview:mode];
     }
-    NSTextField *note = Label(@"Antigravity 自动跳转需要在系统设置中允许「工头喵」。临时签名版更新后可能需重新授权。",11,NSColor.secondaryLabelColor);
+    NSTextField *note = Label(@"Antigravity 自动跳转与全局输入镜像需要在系统设置中允许「工头喵」使用辅助功能。临时签名版更新后可能需重新授权。",11,NSColor.secondaryLabelColor);
     note.frame = NSMakeRect(22,89,676,25); [root addSubview:note];
     NSButton *setup = [NSButton buttonWithTitle:self.integrationSetup.running ? @"正在接入…" : @"接入已安装客户端" target:self action:@selector(setupIntegrations:)];
     setup.frame = NSMakeRect(22,35,168,32); setup.enabled = !self.integrationSetup.running; [root addSubview:setup];
-    NSButton *antigravity = [NSButton buttonWithTitle:@"任务跳转授权" target:self action:@selector(requestAntigravityAccess:)];
+    NSButton *antigravity = [NSButton buttonWithTitle:@"辅助功能授权" target:self action:@selector(requestAntigravityAccess:)];
     antigravity.frame = NSMakeRect(198,35,170,32); [root addSubview:antigravity];
+    self.integrationsAccessibilityButton = antigravity;
+    [self updateAccessibilityButtons];
     NSButton *remove = [NSButton buttonWithTitle:@"移除接入配置" target:self action:@selector(removeIntegrations:)];
     remove.frame = NSMakeRect(376,35,130,32); remove.enabled = !self.integrationSetup.running;
     remove.toolTip = @"仅移除工头喵添加的观察事件，保留客户端原有配置";
@@ -885,8 +1307,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:dismissed options:0 error:NULL];
     NSError *error;
     if (![data writeToFile:[DataDirectory() stringByAppendingPathComponent:@"dismissed.json"] options:NSDataWritingAtomic error:&error]) {
-        self.monitorError = @"保存跳转状态失败，请重试";
-        [self rebuild];
+        [self showToast:@"保存跳转状态失败，请重试" isError:YES duration:3.0];
         return;
     }
     self.dismissed = dismissed;
@@ -924,17 +1345,26 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     }
     self.statusItem.button.image = MascotImage(self.celebration.settings[@"mascotID"],20);
     self.statusItem.button.imagePosition = NSImageLeft;
-    self.statusItem.button.title = [NSString stringWithFormat:@" %lu", (unsigned long)self.tasks.count];
+    BOOL dnd = [self isDoNotDisturbEnabled];
+    self.statusItem.button.title = dnd
+        ? [NSString stringWithFormat:@" 🌙 %lu", (unsigned long)self.tasks.count]
+        : [NSString stringWithFormat:@" %lu", (unsigned long)self.tasks.count];
     NSString *roleName = MascotDefinition(self.celebration.settings[@"mascotID"])[@"name"];
-    self.statusItem.button.toolTip = [NSString stringWithFormat:@"%@\n点击进入主面板，右键显示菜单",roleName];
+    self.statusItem.button.toolTip = [NSString stringWithFormat:@"%@%@\n点击进入主面板，右键显示菜单",roleName, dnd ? @"（勿扰中）" : @""];
     NSScreen *screen = self.panel.screen ?: NSScreen.mainScreen;
-    NSArray *displayed = self.showingHistory ? [self.history subarrayWithRange:NSMakeRange(0,MIN(self.historyLimit,self.history.count))] : self.tasks;
-    BOOL hasMore = self.showingHistory && self.history.count > displayed.count;
+    NSArray *historyPool = self.showingHistory ? [self filteredHistory] : @[];
+    NSArray *displayed = self.showingHistory ? [historyPool subarrayWithRange:NSMakeRange(0,MIN(self.historyLimit,historyPool.count))] : self.tasks;
+    BOOL hasMore = self.showingHistory && historyPool.count > displayed.count;
     CGFloat width = self.collapsed ? 206 : 360;
     CGFloat rowsHeight = displayed.count * 38 + (hasMore ? 32 : 0);
+    CGFloat searchHeight = (!self.collapsed && self.showingHistory) ? 32 : 0;
+    CGFloat toastHeight = (!self.collapsed && self.toastMessage.length) ? 34 : 0;
     CGFloat noticeHeight = self.antigravityNotice.length ? 48 : 0;
-    CGFloat listHeight = MIN(rowsHeight, MIN(380, screen.visibleFrame.size.height - 100 - noticeHeight));
-    CGFloat height = self.collapsed ? 40 : 50 + noticeHeight + (displayed.count ? listHeight : 30);
+    CGFloat bottomInset = toastHeight + noticeHeight;
+    CGFloat listHeight = MIN(rowsHeight, MIN(380, screen.visibleFrame.size.height - 100 - bottomInset - searchHeight));
+    CGFloat height = self.collapsed ? 40 : 50 + searchHeight + bottomInset + (displayed.count ? listHeight : 30);
+    self.panel.allowKeyWindow = (!self.collapsed && self.showingHistory);
+    BOOL keepSearchFocus = (self.historySearchField && self.panel.firstResponder == self.historySearchField.currentEditor);
     NSRect old = self.panel.frame;
     NSRect frame = NSMakeRect(NSMaxX(old)-width, NSMaxY(old)-height, width, height);
     frame.origin.x = MIN(MAX(frame.origin.x, NSMinX(screen.visibleFrame)+8), NSMaxX(screen.visibleFrame)-width-8);
@@ -942,7 +1372,10 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     self.rebuilding = YES;
     [self.panel setFrame:frame display:YES animate:self.animateResize];
     self.rebuilding = NO;
-    PanelSurface *root = [[PanelSurface alloc] initWithFrame:NSMakeRect(0,0,width,height)];
+    HoverPanelSurface *root = [[HoverPanelSurface alloc] initWithFrame:NSMakeRect(0,0,width,height)];
+    __weak PanelController *weakHover = self;
+    root.onMouseEntered = ^{ [weakHover panelPointerDidEnter]; };
+    root.onMouseExited = ^{ [weakHover panelPointerDidExit]; };
     root.fillColor = PanelColor(0xf8faff,0x1a1c21,0.98);
     root.layer.cornerRadius = self.collapsed ? 20 : 16;
     root.layer.masksToBounds = YES;
@@ -962,6 +1395,21 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         item.state = index == [self.celebration.settings[@"theme"] integerValue] ? NSControlStateValueOn : NSControlStateValueOff;
     }
     themesItem.submenu = themes;
+    [panelMenu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *collapseMenuItem = [panelMenu addItemWithTitle:@"单屏自动收起" action:@selector(toggleAutoCollapseFromMenu:) keyEquivalent:@""];
+    collapseMenuItem.target = self;
+    collapseMenuItem.state = [self isAutoCollapseEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *mirrorMenuItem = [panelMenu addItemWithTitle:@"全局输入镜像（⌥⌘M）" action:@selector(toggleInputMirrorFromMenu:) keyEquivalent:@""];
+    mirrorMenuItem.target = self;
+    mirrorMenuItem.state = [self.celebration.settings[@"inputMirrorEnabled"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    NSMenuItem *dndMenuItem = [panelMenu addItemWithTitle:@"勿扰模式" action:@selector(toggleDoNotDisturbFromMenu:) keyEquivalent:@""];
+    dndMenuItem.target = self;
+    dndMenuItem.state = dnd ? NSControlStateValueOn : NSControlStateValueOff;
+    [panelMenu addItem:[NSMenuItem separatorItem]];
+    if (self.statusItem) {
+        [panelMenu addItemWithTitle:@"隐藏任务浮窗" action:@selector(toggleVisible:) keyEquivalent:@""].target = self;
+    }
+    [panelMenu addItemWithTitle:@"退出应用" action:@selector(quitApplication:) keyEquivalent:@""].target = self;
     root.menu = panelMenu;
     self.panel.contentView = root;
     NSString *summaryStatus = waiting ? @"waiting" : @"running";
@@ -970,6 +1418,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     if (allCompleted) summaryStatus = @"completed";
     NSString *heading = self.collapsed && self.tasks.count
         ? [NSString stringWithFormat:@"%@ · %lu",roleName,(unsigned long)self.tasks.count] : roleName;
+    if (self.collapsed && dnd) heading = [heading stringByAppendingString:@" · 勿扰"];
     NSTextField *title = Label(heading, self.collapsed ? 12 : 14, NSColor.labelColor);
     title.font = [NSFont systemFontOfSize:self.collapsed ? 12 : 14 weight:NSFontWeightSemibold];
     title.frame = self.collapsed ? NSMakeRect(46,0,width-88,height) : NSMakeRect(48,height-36,156,24);
@@ -1026,6 +1475,36 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         dismiss.frame = NSMakeRect(width-30,13,22,24);
         [root addSubview:dismiss];
     }
+    if (toastHeight) {
+        PanelSurface *toastBar = [[PanelSurface alloc] initWithFrame:NSMakeRect(10, 8 + noticeHeight, width - 20, 26)];
+        NSColor *accent = self.toastIsError ? NSColor.systemOrangeColor : NSColor.systemBlueColor;
+        toastBar.fillColor = [accent colorWithAlphaComponent:0.16];
+        toastBar.outlineColor = [accent colorWithAlphaComponent:0.42];
+        toastBar.layer.borderWidth = 0.75;
+        toastBar.layer.cornerRadius = 7;
+        NSTextField *toastLabel = Label(self.toastMessage, 11.5, self.toastIsError ? NSColor.systemOrangeColor : NSColor.labelColor);
+        toastLabel.frame = NSMakeRect(10, 0, width - 40, 26);
+        [toastBar addSubview:toastLabel];
+        [root addSubview:toastBar];
+    }
+    if (searchHeight) {
+        if (!self.historySearchField) {
+            self.historySearchField = [[NSSearchField alloc] initWithFrame:NSMakeRect(12, height - 74, width - 24, 24)];
+            self.historySearchField.controlSize = NSControlSizeSmall;
+            self.historySearchField.font = [NSFont systemFontOfSize:12];
+            self.historySearchField.placeholderString = @"搜索历史（标题 / 项目 / 应用）";
+            self.historySearchField.sendsWholeSearchString = NO;
+            self.historySearchField.sendsSearchStringImmediately = YES;
+            self.historySearchField.delegate = self;
+        }
+        self.historySearchField.frame = NSMakeRect(12, height - 74, width - 24, 24);
+        [root addSubview:self.historySearchField];
+        if (keepSearchFocus) {
+            [self.panel makeFirstResponder:self.historySearchField];
+            NSText *editor = self.historySearchField.currentEditor;
+            if (editor) editor.selectedRange = NSMakeRange(self.historySearchField.stringValue.length, 0);
+        }
+    }
     if (self.monitorError.length) {
         title.textColor = NSColor.systemOrangeColor;
         title.toolTip = [NSString stringWithFormat:@"%@\n%@",heading,self.monitorError];
@@ -1040,12 +1519,15 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
         [root addSubview:button];
     }
     if (!displayed.count) {
-        NSTextField *empty = Label(self.showingHistory ? @"暂无历史对话" : @"当前没有进行中的任务",12,NSColor.tertiaryLabelColor);
-        empty.frame = NSMakeRect(16,17+noticeHeight,width-32,20);
+        NSString *emptyText = self.showingHistory
+            ? (self.historyQuery.length ? @"没有匹配的历史对话" : @"暂无历史对话")
+            : @"当前没有进行中的任务";
+        NSTextField *empty = Label(emptyText,12,NSColor.tertiaryLabelColor);
+        empty.frame = NSMakeRect(16,17+bottomInset,width-32,20);
         [root addSubview:empty];
         return;
     }
-    NSScrollView *scroll = PanelScrollView(NSMakeRect(8,8+noticeHeight,width-16,listHeight), rowsHeight);
+    NSScrollView *scroll = PanelScrollView(NSMakeRect(8,8+bottomInset,width-16,listHeight), rowsHeight);
     NSView *document = scroll.documentView;
     // Reserve the hit area even when macOS overlays the scroller on the document.
     CGFloat scrollerGutter = scroll.hasVerticalScroller ? MAX(
@@ -1137,6 +1619,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
     }
 }
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [self unregisterMirrorHotKey];
     [self.celebration stop];
     if (self.monitor.running) [self.monitor terminate];
 }
@@ -1245,8 +1728,11 @@ int main(int argc, const char *argv[]) {
                 NSCAssert(NSMinX(name.frame) > NSMaxX(avatar.frame), @"The cat name appears next to the avatar");
                 for (NSView *button in tabs)
                     NSCAssert(NSMinX(button.frame) > NSMaxX(name.frame) && fabs(NSMidY(button.frame)-NSMidY(avatar.frame)) < 1, @"Tabs sit to the right of the cat name on the same line");
-                NSCAssert(controller.panel.frame.size.height == 430, @"Single-line header keeps the history panel compact");
+                NSCAssert(controller.panel.frame.size.height == 462, @"Single-line header + compact search bar keeps the history panel compact");
                 NSCAssert(controller.showingHistory && !controller.collapsed && list().documentView.subviews.count == 11, @"History defaults to ten rows plus load more");
+                controller.historyQuery = @"历史对话 25"; [controller rebuild];
+                NSCAssert(list().documentView.subviews.count == 1, @"History search must filter matching entries");
+                controller.historyQuery = @""; [controller rebuild];
                 [controller loadMoreHistory:nil];
                 NSCAssert(list().documentView.subviews.count == 21, @"Load more adds ten rows");
                 [controller loadMoreHistory:nil];
@@ -1395,6 +1881,253 @@ int main(int argc, const char *argv[]) {
                 CGContextEndTransparencyLayer(previewContext);
                 [NSGraphicsContext restoreGraphicsState];
                 [[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:args[2] atomically:YES];
+                return 0;
+            }
+            if ([args containsObject:@"--input-mirror-ui-test"]) {
+                // 1. Default OFF
+                NSCAssert(![controller.celebration.settings[@"inputMirrorEnabled"] boolValue], @"Input mirror must be disabled by default");
+                NSCAssert(!controller.inputMirror.enabled && !controller.inputMirror.visible, @"Input mirror must start inactive and hidden");
+
+                // 2. Supported AI app allowlist, password exclusion & editable input classification
+                NSCAssert(InputMirrorIsSupportedAIApp(@"com.google.antigravity", @"Antigravity"), @"Antigravity must be supported");
+                NSCAssert(InputMirrorIsSupportedAIApp(@"com.openai.codex", @"Codex"), @"Codex must be supported");
+                NSCAssert(InputMirrorIsSupportedAIApp(@"com.todesktop.230313mzl4w4u92", @"Cursor"), @"Cursor must be supported");
+                NSCAssert(InputMirrorIsSupportedAIApp(@"com.alibaba.tongyi", @"千问"), @"Qianwen must be supported");
+                NSCAssert(!InputMirrorIsSupportedAIApp(@"com.apple.Safari", @"Safari"), @"Non-AI browser Safari must be ignored");
+                NSCAssert(!InputMirrorIsSupportedAIApp(@"com.tencent.xinWeChat", @"WeChat"), @"Non-AI app WeChat must be ignored");
+                NSCAssert(!InputMirrorIsSupportedAIApp(@"com.apple.finder", @"Finder"), @"Non-AI app Finder must be ignored");
+                NSCAssert(InputMirrorIsPlaceholderText(@"和 Codex 一起工作", nil, nil, nil, NSMakeRange(0, 0)), @"Codex placeholder must be filtered out when empty");
+                NSCAssert(InputMirrorIsPlaceholderText(@"Ask anything...", nil, @"Ask anything…", nil, NSMakeRange(0, 0)), @"Description-matching placeholder must be filtered out");
+                NSCAssert(!InputMirrorIsPlaceholderText(@"和 Codex 一起工作，帮我写测试", nil, nil, nil, NSMakeRange(14, 0)), @"Real user text must never be filtered out");
+                NSCAssert(InputMirrorIsSecureMetadata(@"AXSecureTextField", nil, nil, NO), @"AXSecureTextField role must be excluded");
+                NSCAssert(InputMirrorIsSecureMetadata(@"AXTextField", @"AXSecureTextField", nil, NO), @"AXSecureTextField subrole must be excluded");
+                NSCAssert(InputMirrorIsSecureMetadata(@"AXTextField", nil, @"secure text field", NO), @"Secure role description must be excluded");
+                NSCAssert(InputMirrorIsSecureMetadata(@"AXTextField", nil, nil, YES), @"Protected field must be excluded");
+                NSCAssert(!InputMirrorIsEditableMetadata(@"AXTextField", @"AXSecureTextField", nil, NO, YES, YES, YES), @"Secure text field must never be mirrored");
+                NSCAssert(InputMirrorIsEditableMetadata(@"AXTextField", nil, nil, NO, NO, YES, YES), @"Standard AXTextField must be mirrored");
+                NSCAssert(InputMirrorIsEditableMetadata(@"AXTextArea", nil, nil, NO, NO, YES, YES), @"Standard AXTextArea must be mirrored");
+                NSCAssert(InputMirrorIsEditableMetadata(@"AXGroup", nil, nil, NO, YES, NO, YES), @"Editable contenteditable AXGroup must be mirrored");
+                NSCAssert(!InputMirrorIsEditableMetadata(@"AXButton", nil, nil, NO, NO, NO, NO), @"Non-editable AXButton must not be mirrored");
+
+                // 3. Control panel toggle & persistence
+                [controller showMainPanel:nil];
+                NSCAssert(controller.celebration.inputMirrorCheckbox != nil, @"Main panel must show input mirror checkbox");
+                NSCAssert(controller.celebration.inputMirrorCheckbox.state == NSControlStateValueOff, @"Checkbox must start unchecked");
+                controller.celebration.inputMirrorCheckbox.state = NSControlStateValueOn;
+                [controller.celebration changeSetting:controller.celebration.inputMirrorCheckbox];
+                NSCAssert(controller.inputMirror.enabled, @"Enabling checkbox must enable input mirror");
+                CelebrationController *reloaded = [[CelebrationController alloc] initWithDirectory:DataDirectory()];
+                NSCAssert([reloaded.settings[@"inputMirrorEnabled"] boolValue], @"Input mirror enabled state must persist");
+
+                // 4. Mirror display, rich list formatting, larger typography & direct interactivity
+                controller.inputMirror.defaultsKeyPrefix = @"InputMirrorUITest";
+                [controller.inputMirror resetSavedPosition];
+                NSString *formattedSample = @"1. 有序列表一\n2. 有序列表二\n- 一级无序列表与 `代码`\n  ◦ 二级无序列表\n    ▪ 三级无序列表\n\t+ Tab 缩进二级\n\t\t* Tab 缩进三级";
+                [controller.inputMirror updateMirroredText:formattedSample selection:NSMakeRange(3, 2) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror showPreviewSample];
+                NSCAssert(controller.inputMirror.visible, @"Preview must display input mirror panel");
+                NSCAssert(controller.inputMirror.panel.becomesKeyOnlyIfNeeded, @"Panel must only become key when user interacts with text view");
+                NSCAssert(controller.inputMirror.textView.editable && controller.inputMirror.textView.selectable, @"Mirror text view must support direct deletion, newline and cursor movement without an Edit button");
+                NSCAssert(controller.inputMirror.textView.font.pointSize == 15.0, @"Body font must be comfortable 15pt size");
+                NSCAssert([InputMirrorSummaryText(@"第一行\n第二行") isEqualToString:@"7 字 · 2 行"], @"Summary must count characters and lines");
+                NSAttributedString *rich = InputMirrorFormatAttributedText(formattedSample,
+                                                                           [NSFont systemFontOfSize:17.0],
+                                                                           NSColor.labelColor,
+                                                                           NSColor.systemBlueColor,
+                                                                           NSColor.secondaryLabelColor,
+                                                                           NSColor.quaternaryLabelColor,
+                                                                           NSMakeRange(0, 0),
+                                                                           NO);
+                NSCAssert([rich.string isEqualToString:formattedSample], @"Rich formatting must preserve exact string length and indices");
+                NSParagraphStyle *olPara = [rich attribute:NSParagraphStyleAttributeName atIndex:0 effectiveRange:NULL];
+                NSUInteger ul1Index = [formattedSample rangeOfString:@"- 一级"].location;
+                NSUInteger ul2Index = [formattedSample rangeOfString:@"  ◦ 二级"].location;
+                NSUInteger ul3Index = [formattedSample rangeOfString:@"    ▪ 三级"].location;
+                NSUInteger tab2Index = [formattedSample rangeOfString:@"\t+ Tab"].location;
+                NSUInteger tab3Index = [formattedSample rangeOfString:@"\t\t* Tab"].location;
+                NSParagraphStyle *ul1Para = [rich attribute:NSParagraphStyleAttributeName atIndex:ul1Index effectiveRange:NULL];
+                NSParagraphStyle *ul2Para = [rich attribute:NSParagraphStyleAttributeName atIndex:ul2Index effectiveRange:NULL];
+                NSParagraphStyle *ul3Para = [rich attribute:NSParagraphStyleAttributeName atIndex:ul3Index effectiveRange:NULL];
+                NSParagraphStyle *tab2Para = [rich attribute:NSParagraphStyleAttributeName atIndex:tab2Index effectiveRange:NULL];
+                NSParagraphStyle *tab3Para = [rich attribute:NSParagraphStyleAttributeName atIndex:tab3Index effectiveRange:NULL];
+                NSCAssert(olPara.headIndent > olPara.firstLineHeadIndent && ul1Para.headIndent > ul1Para.firstLineHeadIndent, @"Ordered and unordered lists must render with hanging indentation");
+                NSCAssert(ul2Para.firstLineHeadIndent > ul1Para.firstLineHeadIndent && ul3Para.firstLineHeadIndent > ul2Para.firstLineHeadIndent, @"Nested unordered lists must progressively increase first-line indentation");
+                NSCAssert(ul2Para.headIndent > ul1Para.headIndent && ul3Para.headIndent > ul2Para.headIndent, @"Nested unordered lists must progressively increase hanging indentation");
+                NSCAssert(tab2Para.headIndent > ul1Para.headIndent && tab3Para.headIndent > tab2Para.headIndent, @"Tab-indented nested unordered lists must progressively increase hanging indentation");
+                NSColor *ul1Color = [rich attribute:InputMirrorListBulletColorAttributeName atIndex:ul1Index effectiveRange:NULL];
+                NSColor *ul2Color = [rich attribute:InputMirrorListBulletColorAttributeName atIndex:ul2Index + 2 effectiveRange:NULL];
+                NSColor *ul3Color = [rich attribute:InputMirrorListBulletColorAttributeName atIndex:ul3Index + 4 effectiveRange:NULL];
+                NSCAssert(ul1Color.alphaComponent > ul2Color.alphaComponent && ul2Color.alphaComponent > ul3Color.alphaComponent, @"Nested unordered list bullets must visually step down in emphasis by level");
+
+                // 5. Cross-screen drag memory & unplug fallback
+                NSRect customFrame = NSMakeRect(NSMinX(NSScreen.mainScreen.visibleFrame) + 90,
+                                                NSMinY(NSScreen.mainScreen.visibleFrame) + 120,
+                                                600, 216);
+                [controller.inputMirror.panel setFrame:customFrame display:YES];
+                [controller.inputMirror windowDidMove:[NSNotification notificationWithName:NSWindowDidMoveNotification object:controller.inputMirror.panel]];
+                NSString *savedFrameStr = [NSUserDefaults.standardUserDefaults stringForKey:@"InputMirrorUITestFrame"];
+                NSCAssert(savedFrameStr.length > 0 && NSEqualRects(NSRectFromString(savedFrameStr), customFrame), @"Moved frame must be persisted");
+                NSRect offscreenSaved = NSMakeRect(-99999, -99999, 600, 216);
+                NSRect recovered = InputMirrorRestoredFrame(offscreenSaved, 999999, NSScreen.screens, NSScreen.mainScreen);
+                NSCAssert(NSIntersectsRect(NSScreen.mainScreen.visibleFrame, recovered), @"Disconnected screen frame must fall back to visible main screen");
+
+                // 6. Direct Shift+Enter newline, Backspace deletion & Enter send-to-auto-close
+                __block NSString *syncedText = nil;
+                __block BOOL sentFlag = NO;
+                controller.inputMirror.onSyncBack = ^(NSString *text, BOOL shouldSend) {
+                    syncedText = text;
+                    sentFlag = shouldSend;
+                };
+                [controller.inputMirror updateMirroredText:@"Hello!" selection:NSMakeRange(6, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(6, 0)];
+                [controller.inputMirror.textView deleteBackward:nil];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"Hello"], @"Direct deletion must work inside floating input");
+                NSEvent *shiftReturn = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagShift timestamp:0 windowNumber:0 context:nil characters:@"\r" charactersIgnoringModifiers:@"\r" isARepeat:NO keyCode:36];
+                [controller.inputMirror.textView keyDown:shiftReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"Hello\n"] && !sentFlag, @"Shift+Enter must insert newline without sending");
+                NSEvent *plainReturn = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil characters:@"\r" charactersIgnoringModifiers:@"\r" isARepeat:NO keyCode:36];
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert(sentFlag && [syncedText isEqualToString:@"Hello\n"], @"Enter must sync text and trigger send");
+                NSCAssert(!controller.inputMirror.visible, @"Mirror panel must automatically close after send");
+
+                // 6b. Smart multi-level list editing (Shift+Enter continue/outdent/exit, Tab/Shift+Tab indent/outdent, Backspace outdent/exit)
+                NSEvent *tabKey = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil characters:@"\t" charactersIgnoringModifiers:@"\t" isARepeat:NO keyCode:48];
+                NSEvent *shiftTabKey = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagShift timestamp:0 windowNumber:0 context:nil characters:@"\x19" charactersIgnoringModifiers:@"\t" isARepeat:NO keyCode:48];
+                NSEvent *deleteKey = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil characters:@"\x7f" charactersIgnoringModifiers:@"\x7f" isARepeat:NO keyCode:51];
+
+                // Unordered list: continue -> Tab indent x2 -> Backspace outdent x2 -> exit list
+                [controller.inputMirror updateMirroredText:@"- 第一项" selection:NSMakeRange(5, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(5, 0)];
+                [controller.inputMirror.textView keyDown:shiftReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- 第一项\n- "], @"Shift+Enter on unordered list must continue unordered list");
+                [controller.inputMirror.textView keyDown:tabKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- 第一项\n  - "], @"Tab must indent to level-2 unordered list");
+                [controller.inputMirror.textView keyDown:tabKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- 第一项\n    - "], @"Second Tab must indent to level-3 unordered list");
+                [controller.inputMirror.textView keyDown:deleteKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- 第一项\n  - "], @"Backspace at level-3 prefix must outdent to level-2");
+                [controller.inputMirror.textView keyDown:deleteKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- 第一项\n- "], @"Backspace at level-2 prefix must outdent to level-1");
+                [controller.inputMirror.textView keyDown:deleteKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- 第一项\n"], @"Backspace at level-1 prefix must exit unordered list");
+
+                // Unicode bullet cycling (• -> ◦ -> ▪) on Tab / Shift+Tab
+                [controller.inputMirror updateMirroredText:@"• 主项" selection:NSMakeRange(4, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(4, 0)];
+                [controller.inputMirror.textView keyDown:shiftReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"• 主项\n• "], @"Shift+Enter must preserve Unicode bullet");
+                [controller.inputMirror.textView keyDown:tabKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"• 主项\n  ◦ "], @"Tab on • must cycle to level-2 ◦");
+                [controller.inputMirror.textView keyDown:tabKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"• 主项\n    ▪ "], @"Second Tab on ◦ must cycle to level-3 ▪");
+                [controller.inputMirror.textView keyDown:shiftTabKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"• 主项\n  ◦ "], @"Shift+Tab on ▪ must outdent back to ◦");
+
+                // Non-empty nested item Backspace at prefix boundary preserves item text while outdenting
+                [controller.inputMirror updateMirroredText:@"  - 子项" selection:NSMakeRange(4, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(4, 0)];
+                [controller.inputMirror.textView keyDown:deleteKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- 子项"] && controller.inputMirror.textView.selectedRange.location == 2, @"Backspace at nested prefix boundary must outdent while keeping text");
+                [controller.inputMirror.textView keyDown:deleteKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"子项"] && controller.inputMirror.textView.selectedRange.location == 0, @"Backspace at top-level prefix boundary must exit list while keeping text");
+
+                // Empty nested item Shift+Enter outdents then exits
+                [controller.inputMirror updateMirroredText:@"  - " selection:NSMakeRange(4, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(4, 0)];
+                [controller.inputMirror.textView keyDown:shiftReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- "], @"Shift+Enter on empty nested item must outdent");
+                [controller.inputMirror.textView keyDown:shiftReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@""], @"Shift+Enter on empty top-level item must exit list");
+
+                // Ordered list & task list smart continuation + indent/outdent renumbering
+                [controller.inputMirror updateMirroredText:@"1. 第一步" selection:NSMakeRange(6, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(6, 0)];
+                [controller.inputMirror.textView keyDown:shiftReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"1. 第一步\n2. "], @"Shift+Enter on ordered list must auto-increment number");
+                [controller.inputMirror.textView keyDown:tabKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"1. 第一步\n  1. "], @"Tab on ordered list must start sub-list at 1.");
+                [controller.inputMirror.textView keyDown:shiftTabKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"1. 第一步\n2. "], @"Shift+Tab on ordered list must restore parent sequence number");
+
+                [controller.inputMirror updateMirroredText:@"- [x] 已完成" selection:NSMakeRange(9, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(9, 0)];
+                [controller.inputMirror.textView keyDown:shiftReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"- [x] 已完成\n- [ ] "], @"Shift+Enter on checked task item must create unchecked next task");
+
+                // 7. Task jump suppression until next external mouse click
+                [controller.inputMirror showPreviewSample];
+                NSCAssert(controller.inputMirror.visible, @"Panel visible before task jump");
+                [controller.inputMirror suppressAutoPopupUntilNextClick];
+                NSCAssert(!controller.inputMirror.visible && controller.inputMirror.awaitingUserClickAfterJump, @"Task jump must hide mirror and suppress auto-popup until next click");
+                [controller.inputMirror handleExternalMouseClick];
+                NSCAssert(!controller.inputMirror.awaitingUserClickAfterJump, @"External mouse click must clear jump suppression");
+
+                // 7b. IME placeholder hiding, auto-height growth clamp, Cmd+A select-all & 4 designer styles
+                [controller.inputMirror updateMirroredText:@"" selection:NSMakeRange(0, 0) appName:@"Codex" appIcon:nil];
+                NSCAssert(controller.inputMirror.textView.showingMirrorPlaceholder, @"Placeholder must show when empty");
+                [controller.inputMirror.textView setMarkedText:@"nihao" selectedRange:NSMakeRange(5, 0) replacementRange:NSMakeRange(0, 0)];
+                NSCAssert(!controller.inputMirror.textView.showingMirrorPlaceholder, @"Placeholder must hide immediately during Pinyin/IME composition");
+                [controller.inputMirror.textView unmarkText];
+
+                NSCAssert(InputMirrorTargetHeightForContentHeight(20) == 112.0, @"Short text must use compact min height");
+                NSCAssert(InputMirrorTargetHeightForContentHeight(200) > 180.0 && InputMirrorTargetHeightForContentHeight(200) < 360.0, @"Multi-line text must grow height adaptively");
+                NSCAssert(InputMirrorTargetHeightForContentHeight(900) == 360.0, @"Tall text must clamp to max height");
+
+                [controller.inputMirror updateMirroredText:@"Select me all" selection:NSMakeRange(0, 0) appName:@"Codex" appIcon:nil];
+                NSEvent *cmdA = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:0 context:nil characters:@"a" charactersIgnoringModifiers:@"a" isARepeat:NO keyCode:0];
+                BOOL handledCmdA = [controller.inputMirror.textView performKeyEquivalent:cmdA];
+                NSCAssert(handledCmdA && NSEqualRanges(controller.inputMirror.textView.selectedRange, NSMakeRange(0, 13)), @"Cmd+A must select all text in accessory app");
+
+                NSCAssert(InputMirrorStyleTitles().count == 4 && controller.celebration.inputMirrorStyleControl.numberOfItems == 4, @"Must provide 4 selectable input mirror styles");
+                [controller.celebration.inputMirrorStyleControl selectItemAtIndex:InputMirrorStyleTerminal];
+                [controller.celebration changeSetting:controller.celebration.inputMirrorStyleControl];
+                NSCAssert(controller.inputMirror.style == InputMirrorStyleTerminal, @"Style selector must update mirror style");
+                CelebrationController *styleReloaded = [[CelebrationController alloc] initWithDirectory:DataDirectory()];
+                NSCAssert([styleReloaded.settings[@"inputMirrorStyle"] integerValue] == InputMirrorStyleTerminal, @"Selected input mirror style must persist");
+
+                // 8. Auto-collapse (single-screen mode): default OFF, hover expand, 10s idle collapse, task change expand
+                NSCAssert(![controller isAutoCollapseEnabled], @"Auto-collapse must be disabled by default");
+                NSCAssert(controller.celebration.autoCollapseCheckbox != nil && controller.celebration.autoCollapseCheckbox.state == NSControlStateValueOff, @"Auto-collapse checkbox must be present and unchecked by default");
+                controller.autoCollapseDelay = 0.08;
+                controller.hoverExitCollapseDelay = 0.05;
+                controller.collapsed = NO;
+                controller.celebration.autoCollapseCheckbox.state = NSControlStateValueOn;
+                [controller.celebration changeSetting:controller.celebration.autoCollapseCheckbox];
+                NSCAssert([controller isAutoCollapseEnabled] && controller.collapsed, @"Enabling auto-collapse must collapse the panel by default");
+                CelebrationController *autoCollapseReloaded = [[CelebrationController alloc] initWithDirectory:DataDirectory()];
+                NSCAssert([autoCollapseReloaded.settings[@"autoCollapsePanel"] boolValue], @"Auto-collapse setting must persist");
+
+                // Hover enter expands, hover exit shrinks after idle delay
+                [controller panelPointerDidEnter];
+                NSCAssert(!controller.collapsed && controller.pointerInsidePanel, @"Pointer enter must expand the list");
+                [controller panelPointerDidExit];
+                NSCAssert(!controller.collapsed && !controller.pointerInsidePanel, @"Pointer exit must keep list open during idle grace period");
+                NSDate *collapseDeadline1 = [NSDate dateWithTimeIntervalSinceNow:0.5];
+                while (!controller.collapsed && collapseDeadline1.timeIntervalSinceNow > 0) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+                NSCAssert(controller.collapsed, @"Panel must automatically collapse after idle timeout");
+
+                // Task status change expands and collapses again after idle timeout
+                NSString *snapPath = [DataDirectory() stringByAppendingPathComponent:@"snapshot.json"];
+                NSDictionary *snap1 = @{@"tasks":@[@{@"id":@"t1",@"turn":@"1",@"status":@"running",@"title":@"Task 1"}],@"history":@[]};
+                [[NSJSONSerialization dataWithJSONObject:snap1 options:0 error:NULL] writeToFile:snapPath atomically:YES];
+                controller.signature = nil;
+                controller.preview = NO; [controller refresh]; controller.preview = YES;
+                NSCAssert(controller.collapsed, @"Initial snapshot in auto-collapse mode must remain collapsed");
+                NSDictionary *snap2 = @{@"tasks":@[@{@"id":@"t1",@"turn":@"1",@"status":@"waiting",@"title":@"Task 1"}],@"history":@[]};
+                [[NSJSONSerialization dataWithJSONObject:snap2 options:0 error:NULL] writeToFile:snapPath atomically:YES];
+                controller.preview = NO; [controller refresh]; controller.preview = YES;
+                NSCAssert(!controller.collapsed, @"Task status change must automatically expand the list");
+                NSDate *collapseDeadline2 = [NSDate dateWithTimeIntervalSinceNow:0.5];
+                while (!controller.collapsed && collapseDeadline2.timeIntervalSinceNow > 0) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+                NSCAssert(controller.collapsed, @"Panel must automatically collapse again after task-change idle timeout");
+
+                // Cleanup test defaults
+                [NSUserDefaults.standardUserDefaults removeObjectForKey:@"InputMirrorUITestFrame"];
+                [NSUserDefaults.standardUserDefaults removeObjectForKey:@"InputMirrorUITestScreenID"];
+                [controller.inputMirror stop];
+                [controller.celebration.settingsWindow orderOut:nil];
+                [controller.panel orderOut:nil];
+                puts("Input mirror UI passed: default OFF, secure exclusion, settings toggle persistence, rich list formatting, direct delete/newline/cursor, cross-screen position memory and auto-close on send");
                 return 0;
             }
             if ([args containsObject:@"--ui-test"]) {
@@ -1550,8 +2283,8 @@ int main(int argc, const char *argv[]) {
                 NSCAssert(controller.celebration.settingsWindow.visible && [controller.celebration.settingsWindow.title containsString:@"主面板"], @"Menu bar click opens the main panel");
                 NSCAssert(controller.panel.visible == wasPanelVisible, @"Opening the control panel preserves the floating panel visibility");
                 NSMenu *statusMenu = [controller statusMenu];
-                NSCAssert(statusMenu.numberOfItems == 2, @"Status menu must have just two entries");
-                NSCAssert(statusMenu.itemArray.firstObject.action == @selector(showMainPanel:) && statusMenu.itemArray.lastObject.action == @selector(quitApplication:), @"Status menu must offer just showing the main panel and quitting");
+                NSCAssert(statusMenu.numberOfItems >= 4, @"Status menu must expose main panel, quick toggles, update check and quit");
+                NSCAssert(statusMenu.itemArray.firstObject.action == @selector(showMainPanel:) && statusMenu.itemArray.lastObject.action == @selector(quitApplication:), @"Status menu must start with main panel and end with quit");
                 NSPopUpButton *themeControl = nil;
                 for (NSView *view in controller.celebration.settingsWindow.contentView.subviews) {
                     if ([view isKindOfClass:NSPopUpButton.class] && [(NSPopUpButton *)view action] == @selector(changeTheme:))
@@ -1586,9 +2319,9 @@ int main(int argc, const char *argv[]) {
                     if (button.action == @selector(quitApplication:)) quitButton = button;
                 }
                 NSCAssert(controller.floatingVisibilityButton && historyButton && integrationsButton && quitButton, @"The main panel must expose the functionality directly");
-                NSCAssert([antigravityButton.title isEqualToString:@"任务跳转授权"] && antigravityButton.enabled &&
+                NSCAssert([antigravityButton.title hasPrefix:@"辅助功能"] && antigravityButton.enabled &&
                           NSContainsRect(antigravityButton.superview.bounds,antigravityButton.frame),
-                          @"The main panel must show the Antigravity authorization button");
+                          @"The main panel must show the unified accessibility authorization button with live status");
                 [historyButton performClick:nil];
                 NSCAssert(controller.panel.visible && controller.showingHistory && !controller.collapsed, @"History opens an expanded visible list");
                 [controller.floatingVisibilityButton performClick:nil];
@@ -1613,7 +2346,8 @@ int main(int argc, const char *argv[]) {
                 [controller rebuild];
                 NSCAssert(!controller.statusItem, @"Task refresh must respect hidden status entry");
                 NSMenuItem *fallbackSettings = controller.panel.contentView.menu.itemArray.firstObject;
-                NSCAssert(controller.panel.contentView.menu.numberOfItems == 2 && fallbackSettings.target == controller && fallbackSettings.action == @selector(showMainPanel:), @"Floating panel background provides a main panel entry and theme selector");
+                NSCAssert(controller.panel.contentView.menu.numberOfItems >= 6 && fallbackSettings.target == controller && fallbackSettings.action == @selector(showMainPanel:), @"Floating panel background provides main panel, theme selector, quick toggles and quit");
+                NSCAssert(UpdaterCompareVersions(@"0.4.0", @"0.3.8") == NSOrderedDescending && UpdaterCompareVersions(@"0.3.8", @"0.3.8") == NSOrderedSame, @"Updater semantic version comparison must work");
                 statusControl.state = NSControlStateValueOn;
                 [controller.celebration changeSetting:statusControl];
                 NSCAssert(controller.statusItem && controller.statusItem.button.target == controller, @"Enabling status entry must restore working controls");

@@ -81,35 +81,49 @@ def parse_timestamp(value):
             return 0
 
 
-def set_antigravity_navigation_targets(home, history, entries=None):
-    tasks = [entry for entry in history.values() if entry.get('provider') == 'antigravity']
+def reconcile_antigravity_tasks(home, history, entries=None):
+    tasks = [(key, entry) for key, entry in list(history.items()) if entry.get('provider') == 'antigravity']
     path = home / '.gemini/antigravity/conversation_summaries.db'
     if not tasks or not path.is_file():
         return
-    query = ("SELECT conversation_id, parent_conversation_id FROM conversation_summaries "
-             "WHERE parent_conversation_id <> ''")
     running_sessions = []
     if entries is not None:
         running_sessions = [entry['session'] for entry in entries.values()
                             if entry.get('provider') == 'antigravity' and entry.get('status') == 'running' and entry.get('session')]
 
     def load(connection):
-        parents = dict(connection.execute(query))
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(conversation_summaries)')}
+        if 'nesting_depth' in columns:
+            child_query = (
+                "SELECT conversation_id, parent_conversation_id, COALESCE(nesting_depth, 0) "
+                "FROM conversation_summaries "
+                "WHERE (parent_conversation_id IS NOT NULL AND parent_conversation_id <> '') "
+                "OR COALESCE(nesting_depth, 0) > 0"
+            )
+        else:
+            child_query = (
+                "SELECT conversation_id, parent_conversation_id, 0 "
+                "FROM conversation_summaries "
+                "WHERE parent_conversation_id IS NOT NULL AND parent_conversation_id <> ''"
+            )
+        children = {
+            cid for cid, parent, depth in connection.execute(child_query)
+            if (parent and parent != cid) or (depth and depth > 0)
+        }
         states = {}
-        if running_sessions:
-            columns = {row[1] for row in connection.execute('PRAGMA table_info(conversation_summaries)')}
-            if {'status', 'not_fully_idle', 'killed'}.issubset(columns):
-                modified_col = 'last_modified_time' if 'last_modified_time' in columns else "''"
-                placeholders = ','.join('?' for _ in running_sessions)
-                state_query = (f"SELECT conversation_id, status, not_fully_idle, killed, {modified_col} "
-                               f"FROM conversation_summaries WHERE conversation_id IN ({placeholders})")
-                for cid, db_status, not_fully_idle, killed, modified in connection.execute(state_query, running_sessions):
-                    states[cid] = (db_status, not_fully_idle, killed, modified)
-        return parents, states
+        remaining_running = [cid for cid in running_sessions if cid not in children]
+        if remaining_running and {'status', 'not_fully_idle', 'killed'}.issubset(columns):
+            modified_col = 'last_modified_time' if 'last_modified_time' in columns else "''"
+            placeholders = ','.join('?' for _ in remaining_running)
+            state_query = (f"SELECT conversation_id, status, not_fully_idle, killed, {modified_col} "
+                           f"FROM conversation_summaries WHERE conversation_id IN ({placeholders})")
+            for cid, db_status, not_fully_idle, killed, modified in connection.execute(state_query, remaining_running):
+                states[cid] = (db_status, not_fully_idle, killed, modified)
+        return children, states
 
     try:
         with closing(database(path)) as connection:
-            parents, states = load(connection)
+            children, states = load(connection)
     except sqlite3.Error:
         # SQLite can refuse a read-only open of an idle WAL-mode database
         # whose client removed the sidecars. Never ignore an existing WAL.
@@ -119,19 +133,16 @@ def set_antigravity_navigation_targets(home, history, entries=None):
         try:
             before = path.stat()
             with closing(sqlite3.connect(path.as_uri() + '?mode=ro&immutable=1', uri=True)) as connection:
-                parents, states = load(connection)
+                children, states = load(connection)
             if wal.exists() or path.stat().st_mtime_ns != before.st_mtime_ns:
                 return
         except (OSError, sqlite3.Error):
             return
-    for entry in tasks:
-        target = entry.get('session')
-        visited = {target}
-        while target in parents and parents[target] not in visited:
-            target = parents[target]
-            visited.add(target)
-        if target not in parents and target != entry.get('session'):
-            entry['navigation_id'] = 'antigravity:' + target
+    for key, entry in tasks:
+        if entry.get('session') in children:
+            history.pop(key, None)
+            if entries is not None:
+                entries.pop(key, None)
     if entries is not None and states:
         now = time.time()
         for key, entry in list(entries.items()):
@@ -159,6 +170,8 @@ def deepseek_tasks(home):
         rows = record.get('rows', {})
         def value(key, default=None):
             return rows.get(key, {}).get('val', default)
+        if value('parentSessionId') or value('parent_session_id') or value('isSubagent'):
+            continue
         boundary = value('turnBoundary', {})
         questions = value('userQuestions', {}).get('questions', {}).get('active', [])
         open_turn = boundary.get('openTurnStartSeq')
@@ -227,7 +240,7 @@ def codebuddy_tasks(home):
         with database(path) as connection:
             for key, encoded in connection.execute("SELECT key,value FROM ItemTable WHERE key LIKE 'session:%'"):
                 data = json.loads(encoded)
-                if data.get('deletedAt') is not None:
+                if data.get('deletedAt') is not None or data.get('parentConversationId') or data.get('parentId') or data.get('isSubagent'):
                     continue
                 status = {'Completed': 'completed', 'Running': 'running', 'InProgress': 'running',
                           'Working': 'running', 'Planning': 'running', 'Pending': 'running',
@@ -355,7 +368,8 @@ def qianwen_tasks(home):
         for record in data['threads']:
             thread = record.get('id')
             if (not isinstance(thread, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', thread)
-                    or record.get('projectId') != project or record.get('archived') or record.get('sessionType') == 'voice'):
+                    or record.get('projectId') != project or record.get('archived') or record.get('sessionType') == 'voice'
+                    or record.get('parentId') or record.get('parentThreadId')):
                 continue
             journal = index.parent / thread / 'thread-events.jsonl'
             if journal.resolve() != journal:
@@ -390,6 +404,43 @@ NATIVE = {'deepseek': deepseek_tasks, 'minimax': minimax_tasks,
           'codebuddy': codebuddy_tasks, 'opencode': opencode_tasks, 'qianwen': qianwen_tasks}
 
 
+def _file_sig(path):
+    try:
+        st = path.stat()
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _db_sig(path):
+    return (_file_sig(path), _file_sig(path.with_name(path.name + '-wal')))
+
+
+def _native_provider_sig(provider, home):
+    if provider == 'minimax':
+        return _db_sig(home / '.minimax/v2/sqlite/runtime-state.sqlite')
+    if provider == 'codebuddy':
+        return tuple(
+            _db_sig(home / 'Library/Application Support' / folder / 'codebuddy-sessions.vscdb')
+            for folder in ('CodeBuddy CN', 'CodeBuddy')
+        )
+    if provider == 'opencode':
+        return _db_sig(home / '.local/share/opencode/opencode.db')
+    if provider == 'deepseek':
+        root = home / '.dsh/storages/session_projcache/sessions'
+        if not root.exists():
+            return None
+        return tuple(sorted((p.name, _file_sig(p)) for p in root.glob('session-*.json')))
+    if provider == 'qianwen':
+        sigs = []
+        for idx in qianwen_session_indexes(home):
+            sigs.append((str(idx), _file_sig(idx)))
+            for j in idx.parent.glob('*/thread-events.jsonl'):
+                sigs.append((str(j), _file_sig(j)))
+        return tuple(sorted(sigs))
+    return None
+
+
 class UnifiedMonitor:
     def __init__(self, data, codex=None, home=None):
         self.data = Path(data)
@@ -404,61 +455,160 @@ class UnifiedMonitor:
         self.last_discovery = 0
         self.started = time.time()
         self.installed = {}
+        self._event_cache = {}
+        self._native_sig_cache = {}
+        self._native_tasks_cache = {}
+        self._dismissed_sig = None
+        self._dismissed_cache = {}
+        self._integrations_sig = None
+        self._integrations_cache = {}
+        self._settings_sig = None
+        self._disabled_providers = set()
+        self._ag_db_sig = None
+        self._installed_changed = True
 
     def discover(self):
         if time.time() - self.last_discovery < 30:
             return
         self.last_discovery = time.time()
         roots = [Path('/Applications'), self.home / 'Applications']
-        self.installed = {key: [str(root / (name + '.app')) for root in roots for name in names if (root / (name + '.app')).exists()]
-                          for key, (_, names, _) in PRODUCTS.items()}
+        new_installed = {key: [str(root / (name + '.app')) for root in roots for name in names if (root / (name + '.app')).exists()]
+                         for key, (_, names, _) in PRODUCTS.items()}
+        if new_installed != self.installed:
+            self.installed = new_installed
+            self._installed_changed = True
 
     def tick(self):
         self.discover()
-        entries, errors = {}, {}
-        history = {}
-        dismissed = read_json(self.data / 'dismissed.json', {})
+        any_changed = self.last_output is None or self._installed_changed
+        self._installed_changed = False
+
+        dismissed_sig = _file_sig(self.data / 'dismissed.json')
+        if dismissed_sig != self._dismissed_sig:
+            self._dismissed_cache = read_json(self.data / 'dismissed.json', {})
+            self._dismissed_sig = dismissed_sig
+            any_changed = True
+        dismissed = self._dismissed_cache
+
+        integrations_sig = _file_sig(self.data / 'integrations.json')
+        if integrations_sig != self._integrations_sig:
+            self._integrations_cache = read_json(self.data / 'integrations.json', {})
+            self._integrations_sig = integrations_sig
+            any_changed = True
+        installed_hooks = self._integrations_cache
+
+        settings_sig = _file_sig(self.data / 'settings.json')
+        if settings_sig != self._settings_sig:
+            settings_data = read_json(self.data / 'settings.json', {})
+            raw_disabled = settings_data.get('disabledProviders', []) if isinstance(settings_data, dict) else []
+            self._disabled_providers = {str(p) for p in raw_disabled if isinstance(p, str)}
+            self._settings_sig = settings_sig
+            any_changed = True
+        disabled_providers = self._disabled_providers
+
+        # Check codex
+        codex_tasks = []
+        codex_error = None
         if self.codex and self.codex.database.exists():
             try:
                 codex_tasks = self.codex.tick(publish=False)
-                for entry in self.codex.history:
-                    history[entry['id']] = dict(entry, provider='codex', source='Codex', navigation='session',
-                                                open_url='codex://threads/' + quote(entry['id'], safe=''))
-                for entry in codex_tasks:
-                    entry = dict(entry, provider='codex', source='Codex', navigation='session',
-                                 open_url='codex://threads/' + quote(entry['id'], safe=''))
-                    entries[entry['id']] = entry
+                if getattr(self.codex, 'changed', True):
+                    any_changed = True
             except (OSError, sqlite3.Error, ValueError) as error:
-                errors['codex'] = str(error)
-                entries.update({k: dict(v, stale=True) for k, v in self.entries.items() if v.get('provider') == 'codex'})
+                codex_error = str(error)
+                any_changed = True
+        elif self.source_errors.get('codex'):
+            any_changed = True
+
+        # Check native providers with stat caching
+        native_errors = {}
+        for provider, collect in NATIVE.items():
+            sig = _native_provider_sig(provider, self.home)
+            if provider in self._native_sig_cache and self._native_sig_cache[provider] == sig and provider not in self.source_errors:
+                continue
+            try:
+                self._native_tasks_cache[provider] = collect(self.home)
+                self._native_sig_cache[provider] = sig
+                any_changed = True
+            except (OSError, sqlite3.Error, ValueError, KeyError, TypeError) as error:
+                native_errors[provider] = str(error)
+                any_changed = True
+
+        # Check event files with stat caching
+        events_dir = self.data / 'events'
+        current_event_files = set()
+        if events_dir.exists():
+            for path in events_dir.glob('*.json'):
+                key_path = str(path)
+                current_event_files.add(key_path)
+                sig = _file_sig(path)
+                cached = self._event_cache.get(key_path)
+                if cached and cached[0] == sig:
+                    continue
+                entry = read_json(path)
+                self._event_cache[key_path] = (sig, entry)
+                any_changed = True
+        for stale_key in list(self._event_cache):
+            if stale_key not in current_event_files:
+                del self._event_cache[stale_key]
+                any_changed = True
+
+        # Check if Antigravity DB changed while there are running/tracked antigravity tasks
+        ag_db_sig = _db_sig(self.home / '.gemini/antigravity/conversation_summaries.db')
+        if ag_db_sig != self._ag_db_sig:
+            self._ag_db_sig = ag_db_sig
+            any_changed = True
+        elif any(e.get('provider') == 'antigravity' and e.get('status') == 'running' for e in self.entries.values()):
+            any_changed = True
+
+        # Fast path: nothing changed since last tick, just touch heartbeat!
+        if not any_changed and (self.data / 'snapshot.json').exists():
+            os.utime(self.data / 'snapshot.json', None)
+            return
+
+        entries, errors = {}, {}
+        history = {}
+        if codex_error:
+            errors['codex'] = codex_error
+            entries.update({k: dict(v, stale=True) for k, v in self.entries.items() if v.get('provider') == 'codex'})
+        elif self.codex and self.codex.database.exists():
+            for entry in self.codex.history:
+                history[entry['id']] = dict(entry, provider='codex', source='Codex', navigation='session',
+                                            open_url='codex://threads/' + quote(entry['id'], safe=''))
+            for entry in codex_tasks:
+                entry = dict(entry, provider='codex', source='Codex', navigation='session',
+                             open_url='codex://threads/' + quote(entry['id'], safe=''))
+                entries[entry['id']] = entry
+
         dirty = False
         native_present = set()
-        for provider, collect in NATIVE.items():
-            try:
-                for current in collect(self.home):
-                    key = current['id']
-                    history[key] = current
-                    native_present.add(key)
-                    previous = self.native.get(key)
-                    if provider == 'codebuddy' and previous:
-                        if previous['status'] in ('running', 'waiting') or (previous['status'] == 'completed' and current['status'] == 'completed'):
-                            current['turn'] = previous['turn']
-                    unseen = bool(previous and previous.get('unread'))
-                    if current['status'] == 'completed':
-                        unseen = bool(previous and (unseen or previous['status'] in ('running', 'waiting') or previous['turn'] != current['turn']))
-                        if provider == 'qianwen' and not previous:
-                            unseen = current['updated'] >= self.started
-                    else:
-                        unseen = False
-                    stored = dict(current, unread=unseen)
-                    if previous != stored:
-                        self.native[key] = stored
-                        dirty = True
-                    if current['status'] in ('running', 'waiting') or unseen:
-                        entries[key] = current
-            except (OSError, sqlite3.Error, ValueError, KeyError, TypeError) as error:
-                errors[provider] = str(error)
+        for provider in NATIVE:
+            if provider in native_errors:
+                errors[provider] = native_errors[provider]
                 entries.update({k: dict(v, stale=True) for k, v in self.entries.items() if v.get('provider') == provider})
+                continue
+            for current in self._native_tasks_cache.get(provider, ()):
+                current = dict(current)
+                key = current['id']
+                history[key] = current
+                native_present.add(key)
+                previous = self.native.get(key)
+                if provider == 'codebuddy' and previous:
+                    if previous['status'] in ('running', 'waiting') or (previous['status'] == 'completed' and current['status'] == 'completed'):
+                        current['turn'] = previous['turn']
+                unseen = bool(previous and previous.get('unread'))
+                if current['status'] == 'completed':
+                    unseen = bool(previous and (unseen or previous['status'] in ('running', 'waiting') or previous['turn'] != current['turn']))
+                    if provider == 'qianwen' and not previous:
+                        unseen = current['updated'] >= self.started
+                else:
+                    unseen = False
+                stored = dict(current, unread=unseen)
+                if previous != stored:
+                    self.native[key] = stored
+                    dirty = True
+                if current['status'] in ('running', 'waiting') or unseen:
+                    entries[key] = current
         # Removed sessions are no longer candidates. Keep failed sources intact.
         for key in list(self.native):
             if key not in native_present and self.native[key]['provider'] not in errors:
@@ -467,10 +617,10 @@ class UnifiedMonitor:
         if dirty:
             atomic_json(self.data / 'native-state.json', self.native)
         hooks_seen = set()
-        for path in (self.data / 'events').glob('*.json'):
-            entry = read_json(path)
+        for _, entry in self._event_cache.values():
             if not isinstance(entry, dict) or entry.get('provider') not in PRODUCTS:
                 continue
+            entry = dict(entry)
             history[entry['id']] = entry
             if time.time() - entry.get('updated', 0) > 86400 and entry.get('status') in ('running', 'waiting'):
                 continue  # A vanished client must not look busy forever.
@@ -480,7 +630,10 @@ class UnifiedMonitor:
                 entries[entry['id']] = entry
             else:
                 entries.pop(entry['id'], None)
-        set_antigravity_navigation_targets(self.home, history, entries)
+        reconcile_antigravity_tasks(self.home, history, entries)
+        if disabled_providers:
+            entries = {k: v for k, v in entries.items() if v.get('provider') not in disabled_providers}
+            history = {k: v for k, v in history.items() if v.get('provider') not in disabled_providers}
         for key, entry in history.items():
             if entry.get('navigation') == 'application' and self.installed.get(entry.get('provider')):
                 entry['app'] = Path(self.installed[entry['provider']][0]).stem
@@ -511,20 +664,21 @@ class UnifiedMonitor:
         self.history = [dict({k: v for k, v in entry.items() if k in fields}, updated=updated(entry))
                         for entry in sorted(history.values(), key=lambda entry: (-updated(entry), entry['id']))]
         self.entries = entries
-        installed_hooks = read_json(self.data / 'integrations.json', {})
+        self.source_errors = errors
         health = []
         for key, (name, _, mode) in PRODUCTS.items():
             observed = key in hooks_seen or any(v.get('provider') == key for v in self.native.values())
             configured = installed_hooks.get(key, {})
-            state = '读取异常' if key in errors else ('已收到任务' if observed else ('已配置，等待新任务' if configured.get('installed') else ('已安装，待接入' if self.installed.get(key) else '未检测到客户端')))
-            if configured.get('error') and not observed:
+            is_disabled = key in disabled_providers
+            state = '读取异常' if key in errors else ('已屏蔽' if is_disabled else ('已收到任务' if observed else ('已配置，等待新任务' if configured.get('installed') else ('已安装，待接入' if self.installed.get(key) else '未检测到客户端'))))
+            if configured.get('error') and not observed and not is_disabled:
                 state = '接入配置异常'
-            if key == 'codex' and self.codex and self.codex.database.exists() and key not in errors:
+            if key == 'codex' and self.codex and self.codex.database.exists() and key not in errors and not is_disabled:
                 state = '已连接'
             detail = ''
             if key == 'qianwen':
                 detail = '读取千问「工作」模式写入本机的任务记录。'
-                if key not in errors and not observed:
+                if key not in errors and not observed and not is_disabled:
                     if next(qianwen_session_indexes(self.home), None):
                         state = '已连接'
                     elif self.installed.get(key):
@@ -532,6 +686,7 @@ class UnifiedMonitor:
             if key == 'claude':
                 detail = 'Claude 桌面的 Code 本地会话和 Claude Code CLI 使用相同的事件配置。'
             health.append(dict(id=key, name=name, mode=mode, state=state,
+                               disabled=is_disabled,
                                installed=bool(self.installed.get(key)), apps=self.installed.get(key, []),
                                error=errors.get(key, ''), setup_error=configured.get('error', ''), detail=detail))
         snapshot = dict(tasks=tasks, history=self.history, sources=health, error='', updated=time.time())

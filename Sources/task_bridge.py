@@ -22,6 +22,27 @@ WAIT = {'PermissionRequest', 'permissionRequest', 'Elicitation'}
 END = {'SessionEnd', 'sessionEnd', 'session.end', 'StopFailure'}
 
 
+def _is_subagent_payload(provider, event, payload):
+    if event in ('SubagentStart', 'SubagentStop', 'subagentStart', 'subagentStop'):
+        return True
+    if any(payload.get(k) for k in (
+            'is_subagent', 'isSubagent',
+            'parent_conversation_id', 'parentConversationId',
+            'parent_session_id', 'parentSessionId',
+            'parent_id', 'parentId')):
+        return True
+    if provider == 'claude' and payload.get('agent_id'):
+        return True
+    if provider == 'antigravity':
+        depth = payload.get('nesting_depth', payload.get('nestingDepth'))
+        try:
+            if depth is not None and int(depth) > 0:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
 def receive(provider, event, payload, data, now=None):
     if provider not in PRODUCTS or not isinstance(payload, dict):
         return None
@@ -30,8 +51,7 @@ def receive(provider, event, payload, data, now=None):
     now = now or time.time()
     # Subagent ends do not complete the parent. Registered hooks observe only
     # the main lifecycle; explicit subagent payloads are excluded as well.
-    if (event in ('SubagentStop', 'subagentStop') or payload.get('is_subagent')
-            or (provider == 'claude' and payload.get('agent_id'))):
+    if _is_subagent_payload(provider, event, payload):
         return None
     session = next((payload.get(k) for k in ('session_id', 'sessionId', 'conversation_id', 'conversationId', 'cascade_id') if payload.get(k)), None)
     if not isinstance(session, str) or len(session) > 512:
