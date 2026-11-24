@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Read Codex's local event journal and publish an atomic floating-panel snapshot."""
 import argparse
+from contextlib import closing
 import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import time
 
 HOME = Path.home() / '.codex'
 DATA = Path(os.environ.get('TASK_PANEL_DATA_DIR', str(HOME / 'task-manager')))
 TERMINAL = {'task_complete', 'turn_aborted'}
+COSPAN_JOB_RE = re.compile(
+    rb'\b(?:agy|dsh|claude|codex|gemini|kimi|qwen|opencode|cursor|codebuddy|minimax)-\d{12}-[0-9a-f]{6}\b'
+)
 
 
 def atomic_json(path, value):
@@ -148,6 +153,8 @@ class Monitor:
         self._has_receipts = False
         self._dismissed_sig = None
         self._ordered_cache = []
+        self.rollout_paths = {}
+        self._cospan_job_cache = {}
         self.changed = True
 
     @staticmethod
@@ -157,6 +164,64 @@ class Monitor:
             return (st.st_ino, st.st_size, st.st_mtime_ns)
         except OSError:
             return None
+
+    def _scan_rollout_cospan_jobs(self, thread, filename):
+        path = Path(filename)
+        sig = self._file_sig(path)
+        if sig is None:
+            return set()
+        cached = self._cospan_job_cache.get(thread)
+        if cached and cached['signature'] == sig:
+            return cached['jobs']
+        inode, size, _ = sig
+        if cached and cached['inode'] == inode and size >= cached['offset']:
+            start = max(0, cached['offset'] - 64)
+            jobs = set(cached['jobs'])
+        else:
+            start = 0
+            jobs = set()
+        try:
+            with path.open('rb') as handle:
+                if start:
+                    handle.seek(start)
+                data = handle.read()
+        except OSError:
+            return jobs
+        for match in COSPAN_JOB_RE.findall(data):
+            jobs.add(match.decode('ascii', errors='ignore'))
+        self._cospan_job_cache[thread] = {'signature': sig, 'inode': inode, 'offset': size, 'jobs': jobs}
+        return jobs
+
+    def cospan_job_owners(self, target_jobs, active_ids=None, history_ids=None):
+        """Map cospan job IDs to their parent Codex thread IDs via rollout journals."""
+        if not target_jobs or not self.rollout_paths:
+            return {}
+        remaining = set(target_jobs)
+        owners = {}
+        active_set = set(active_ids or ())
+        # Check active Codex threads first, then recent history threads (newest first).
+        ordered_threads = []
+        seen = set()
+        for tid in active_set:
+            if tid in self.rollout_paths and tid not in seen:
+                ordered_threads.append(tid)
+                seen.add(tid)
+        for entry in sorted(self.history, key=lambda item: -item.get('updated', 0)):
+            tid = entry.get('id')
+            if tid in self.rollout_paths and tid not in seen:
+                if history_ids is None or tid in history_ids:
+                    ordered_threads.append(tid)
+                    seen.add(tid)
+        # Only scan up to the most recent 60 Codex threads to stay fast.
+        for tid in ordered_threads[:60]:
+            if not remaining:
+                break
+            found = self._scan_rollout_cospan_jobs(tid, self.rollout_paths[tid])
+            matched = remaining & found
+            for job_id in matched:
+                owners[job_id] = tid
+            remaining -= matched
+        return owners
 
     def tick(self, publish=True):
         dismissed_sig = self._file_sig(self.data / 'dismissed.json')
@@ -168,7 +233,7 @@ class Monitor:
         db_sig = (self._file_sig(self.database), self._file_sig(wal_path))
         db_changed = db_sig != self._db_sig or self._db_sig is None
         if db_changed:
-            with sqlite3.connect(f'file:{self.database}?mode=ro', uri=True, timeout=2) as connection:
+            def load_db(connection):
                 has_receipts = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_read_receipts'").fetchone()
                 receipts = dict(connection.execute('SELECT thread_id, first_unread_turn FROM thread_read_receipts')) if has_receipts else {}
                 columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
@@ -188,10 +253,28 @@ class Monitor:
                     f"SELECT {updated}, id, COALESCE(NULLIF(name,''),title), cwd, rollout_path "
                     f"FROM threads WHERE {' AND '.join(filters)}"
                 ).fetchall()
+                return has_receipts, receipts, rows
+
+            try:
+                with closing(sqlite3.connect(self.database.as_uri() + '?mode=ro', uri=True, timeout=2)) as connection:
+                    has_receipts, receipts, rows = load_db(connection)
+            except sqlite3.Error:
+                # SQLite can refuse a read-only open of an idle WAL-mode database
+                # whose client removed the sidecars. Never ignore an existing WAL.
+                if wal_path.exists():
+                    raise
+                before = self.database.stat()
+                with closing(sqlite3.connect(self.database.as_uri() + '?mode=ro&immutable=1', uri=True)) as connection:
+                    has_receipts, receipts, rows = load_db(connection)
+                if wal_path.exists() or self.database.stat().st_mtime_ns != before.st_mtime_ns:
+                    with closing(sqlite3.connect(self.database.as_uri() + '?mode=ro', uri=True, timeout=2)) as connection:
+                        has_receipts, receipts, rows = load_db(connection)
             self._db_sig = db_sig
             self._rows_cache = rows
             self._receipts_cache = receipts
             self._has_receipts = bool(has_receipts)
+            self.rollout_paths = {thread: filename for _, thread, _, _, filename in rows if filename}
+            self._cospan_job_cache = {k: v for k, v in self._cospan_job_cache.items() if k in self.rollout_paths}
         else:
             rows = self._rows_cache
             receipts = self._receipts_cache

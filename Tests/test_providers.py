@@ -539,6 +539,180 @@ class IntegrationTests(unittest.TestCase):
         monitor.tick()
         self.assertIn('cursor:c2', monitor.entries)
 
+    def test_cospan_subtasks_merge_into_codex_parent_and_reconcile_status(self):
+        import task_monitor as tm
+        codex_db = self.home / '.codex/state_5.sqlite'
+        codex_db.parent.mkdir(parents=True, exist_ok=True)
+        rollout_a = self.home / '.codex/rollout-a.jsonl'
+        rollout_a.write_text(
+            json.dumps({'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'turn-a'}}) + '\n'
+            + json.dumps({'type': 'response_item', 'payload': {'type': 'function_call_output', 'call_id': 'c1',
+                                                               'output': 'started agy-261123150255-2745ae and dsh-261123150446-473b76 and agy-261123150500-deadbe'}}) + '\n'
+        )
+        with sqlite3.connect(codex_db) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, name TEXT, title TEXT, cwd TEXT, rollout_path TEXT, "
+                "archived INTEGER, thread_source TEXT, attached_thread_parent_id TEXT, updated_at INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?)",
+                ('codex-parent-a', '$prod-rd 研发主任务', '$prod-rd 研发主任务', '/tmp/SmartBiz',
+                 str(rollout_a), 0, 'user', None, int(p.time.time())),
+            )
+        state_file = self.home / '.cospan/trajectories/SmartBiz-abc/state.json'
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            'jobs': [
+                {'id': 'agy-261123150255-2745ae', 'target': 'agy', 'status': 'running',
+                 'model': 'gemini-4-neon-high', 'cwd': '/tmp/SmartBiz',
+                 'conversation_id': 'agy-conv-1', 'started_at': '2026-11-23T15:02:55Z'},
+                {'id': 'dsh-261123150446-473b76', 'target': 'dsh', 'status': 'done',
+                 'model': 'deepseek-official/deepseek-flash', 'cwd': '/tmp/SmartBiz',
+                 'conversation_id': 'session-dsh-1', 'started_at': '2026-11-23T15:04:46Z'},
+                {'id': 'agy-261123150500-deadbe', 'target': 'agy', 'status': 'canceled',
+                 'model': 'claude-opus-5-5-medium', 'cwd': '/tmp/SmartBiz',
+                 'conversation_id': 'agy-conv-canceled', 'started_at': '2026-11-23T15:05:00Z'},
+            ]
+        }))
+        bridge.receive('antigravity', 'PreInvocation', {
+            'conversationId': 'agy-conv-1', 'lastUserInput': '/plan [cospan delegation context]',
+            'workspacePaths': ['/tmp/SmartBiz'],
+        }, self.data)
+        bridge.receive('antigravity', 'PreInvocation', {
+            'conversationId': 'agy-conv-canceled', 'lastUserInput': '/plan [cospan delegation context]',
+            'workspacePaths': ['/tmp/SmartBiz'],
+        }, self.data)
+        dsh_dir = self.home / '.dsh/storages/session_projcache/sessions'
+        dsh_dir.mkdir(parents=True, exist_ok=True)
+        (dsh_dir / 'session-dsh-1.json').write_text(json.dumps({
+            'record': {'rows': {
+                'title': {'val': '[cospan delegation context] - Workspace:'},
+                'turnBoundary': {'val': {'openTurnStartSeq': 1, 'lastTurn': 1}},
+            }}
+        }))
+        codex_mon = tm.Monitor(data=self.data, database=codex_db)
+        um = p.UnifiedMonitor(self.data, codex=codex_mon, home=self.home)
+        um.tick()
+        snap = p.read_json(self.data / 'snapshot.json')
+        # Only the parent Codex task should appear at top level; canceled subtask is stopped.
+        self.assertEqual([t['id'] for t in snap['tasks']], ['codex-parent-a'])
+        subs = snap['tasks'][0].get('subtasks', [])
+        self.assertEqual({s['id'] for s in subs}, {'antigravity:agy-conv-1', 'deepseek:session-dsh-1'})
+        by_id = {s['id']: s for s in subs}
+        self.assertEqual(by_id['antigravity:agy-conv-1']['title'], 'Antigravity · gemini-4-neon-high')
+        self.assertEqual(by_id['antigravity:agy-conv-1']['status'], 'running')
+        self.assertEqual(by_id['deepseek:session-dsh-1']['title'], 'DeepSeek Harness · deepseek-flash')
+        self.assertEqual(by_id['deepseek:session-dsh-1']['status'], 'completed')
+        # History should also group all three subtasks under the parent Codex thread.
+        hist_parent = next(h for h in snap['history'] if h['id'] == 'codex-parent-a')
+        self.assertEqual({s['id'] for s in hist_parent.get('subtasks', [])},
+                         {'antigravity:agy-conv-1', 'deepseek:session-dsh-1', 'antigravity:agy-conv-canceled'})
+        self.assertNotIn('antigravity:agy-conv-1', [h['id'] for h in snap['history']])
+
+    def test_orphaned_completed_and_canceled_cospan_subtasks_never_leak_to_top_level(self):
+        state_file = self.home / '.cospan/trajectories/SmartBiz-orphan/state.json'
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            'jobs': [
+                {'id': 'dsh-261123155438-d0029b', 'target': 'dsh', 'status': 'done',
+                 'model': 'deepseek-flash', 'cwd': '/tmp/SmartBiz',
+                 'conversation_id': 'session-dsh-done', 'started_at': '2026-11-23T15:54:38Z'},
+                {'id': 'dsh-261123150446-473b76', 'target': 'dsh', 'status': 'canceled',
+                 'model': 'deepseek-flash', 'cwd': '/tmp/SmartBiz',
+                 'conversation_id': 'session-dsh-canceled', 'started_at': '2026-11-23T15:04:46Z'},
+            ]
+        }))
+        dsh_dir = self.home / '.dsh/storages/session_projcache/sessions'
+        dsh_dir.mkdir(parents=True, exist_ok=True)
+        # First tick establishes baseline while running, second tick transitions both to completed.
+        for sid, title in [
+            ('session-dsh-done', '你是独立质检者。请对照用户'),
+            ('session-dsh-canceled', '[cospan delegation context] - Workspace:'),
+        ]:
+            (dsh_dir / f'{sid}.json').write_text(json.dumps({
+                'record': {'rows': {
+                    'title': {'val': title},
+                    'turnBoundary': {'val': {'openTurnStartSeq': 1, 'lastTurn': 1}},
+                }}
+            }))
+        um = self.monitor()
+        for sid, title in [
+            ('session-dsh-done', '你是独立质检者。请对照用户'),
+            ('session-dsh-canceled', '[cospan delegation context] - Workspace:'),
+        ]:
+            (dsh_dir / f'{sid}.json').write_text(json.dumps({
+                'record': {'rows': {
+                    'title': {'val': title},
+                    'turnBoundary': {'val': {'openTurnStartSeq': None, 'lastStepBoundary': {'kind': 'end'}, 'lastTurn': 1}},
+                }}
+            }))
+        um.tick()
+        snap = p.read_json(self.data / 'snapshot.json')
+        # Neither the orphaned completed nor the canceled cospan subtask may appear in active tasks.
+        self.assertEqual(snap['tasks'], [])
+        by_hist = {h['id']: h for h in snap['history']}
+        self.assertEqual(by_hist['deepseek:session-dsh-canceled']['status'], 'stopped')
+
+    def test_deepseek_filters_non_workspace_and_archived_sessions_but_keeps_cospan(self):
+        dsh_dir = self.home / '.dsh/storages/session_projcache/sessions'
+        dsh_dir.mkdir(parents=True, exist_ok=True)
+        ws_path = self.home / '.dsh/storages/workspace.json'
+
+        def write_dsh(sid, title, running=True):
+            (dsh_dir / f'{sid}.json').write_text(json.dumps({
+                'record': {'rows': {
+                    'title': {'val': title},
+                    'turnBoundary': {'val': {
+                        'openTurnStartSeq': 1 if running else None,
+                        'lastStepBoundary': {'kind': 'start' if running else 'end'},
+                        'lastTurn': 1,
+                    }},
+                }}
+            }))
+
+        write_dsh('session-desktop', '桌面可见对话')
+        write_dsh('session-archived', '已归档对话')
+        write_dsh('session-headless', 'Remember number 42')
+        write_dsh('session-cospan', '你是独立质检者')
+
+        ws_path.write_text(json.dumps({
+            'global': {'archivedSessionIds': ['session-archived']},
+            'tables': {'workspaces': {
+                'ws-1': {'sessionIds': ['session-desktop', 'session-archived']},
+            }},
+        }))
+        state_file = self.home / '.cospan/trajectories/demo/state.json'
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({
+            'jobs': [{
+                'id': 'dsh-261124160000-abcdef', 'target': 'dsh', 'status': 'running',
+                'model': 'deepseek-flash', 'cwd': '/tmp/demo',
+                'conversation_id': 'session-cospan', 'started_at': '2026-11-24T16:00:00Z',
+            }],
+        }))
+
+        um = self.monitor()
+        ids = {t['id'] for t in p.read_json(self.data / 'snapshot.json')['tasks']}
+        self.assertIn('deepseek:session-desktop', ids)
+        self.assertIn('deepseek:session-cospan', ids)
+        self.assertNotIn('deepseek:session-headless', ids)
+        self.assertNotIn('deepseek:session-archived', ids)
+
+        hist_ids = {h['id'] for h in p.read_json(self.data / 'snapshot.json')['history']}
+        self.assertNotIn('deepseek:session-headless', hist_ids)
+        self.assertNotIn('deepseek:session-archived', hist_ids)
+
+        # Updating workspace.json alone must invalidate the provider cache on the next tick.
+        ws_path.write_text(json.dumps({
+            'global': {'archivedSessionIds': ['session-archived', 'session-desktop']},
+            'tables': {'workspaces': {
+                'ws-1': {'sessionIds': ['session-desktop', 'session-archived']},
+            }},
+        }))
+        um.tick()
+        ids_after = {t['id'] for t in p.read_json(self.data / 'snapshot.json')['tasks']}
+        self.assertNotIn('deepseek:session-desktop', ids_after)
+
 
 if __name__ == '__main__':
     unittest.main()

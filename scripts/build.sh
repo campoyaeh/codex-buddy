@@ -3,7 +3,7 @@ set -euo pipefail
 cd "${0:A:h:h}"
 [[ -z "${1:-}" || "$1" == <->.<->.<-> ]]
 mkdir -p build
-clang -arch arm64 -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -Wno-unused-parameter -framework AppKit -framework QuartzCore -framework ApplicationServices -framework Carbon Sources/TaskPanel.m Sources/Celebration.m Sources/Mascot.m Sources/PanelTheme.m Sources/AntigravityNavigation.m Sources/InputMirror.m Sources/Updater.m -o build/codex-task-complete-popup
+clang -arch arm64 -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -Wno-unused-parameter -lsqlite3 -framework AppKit -framework QuartzCore -framework ApplicationServices -framework Carbon Sources/TaskPanel.m Sources/Celebration.m Sources/Mascot.m Sources/PanelTheme.m Sources/AntigravityNavigation.m Sources/InputMirror.m Sources/Updater.m -o build/codex-task-complete-popup
 bundle="build/工头喵.app"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp Sources/Info.plist "$bundle/Contents/Info.plist"

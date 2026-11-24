@@ -61,6 +61,44 @@ FOUNDATION_EXPORT NSAttributedString *InputMirrorFormatAttributedText(NSString *
                                                                       NSRange mirrorSelection,
                                                                       BOOL showMirrorSelection);
 
+typedef struct {
+    BOOL active;
+    NSRange tokenRange;
+    unichar triggerChar;
+} InputMirrorSkillTrigger;
+
+@interface InputMirrorSkillItem : NSObject
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic, copy) NSString *summary;
+@property(nonatomic, copy) NSString *insertPrefix;
+@property(nonatomic, copy) NSString *sourceLabel;
+@property(nonatomic) BOOL isNativeHandoffAction;
+@property(nonatomic) BOOL requiresNativeHandoff;
+@end
+
+FOUNDATION_EXPORT InputMirrorSkillTrigger InputMirrorParseSkillTrigger(NSString * _Nullable text,
+                                                                       NSRange selection,
+                                                                       NSString * _Nullable * _Nullable outQuery);
+
+FOUNDATION_EXPORT NSArray<InputMirrorSkillItem *> *InputMirrorLoadSkillsForApp(NSString * _Nullable bundleID,
+                                                                               NSString * _Nullable appName,
+                                                                               NSString * _Nullable homeDirOverride);
+
+FOUNDATION_EXPORT NSString * _Nullable InputMirrorResolveWorkspaceRootForApp(NSString * _Nullable bundleID,
+                                                                             NSString * _Nullable appName,
+                                                                             NSString * _Nullable homeDirOverride);
+
+FOUNDATION_EXPORT NSArray<InputMirrorSkillItem *> *InputMirrorLoadMentionsForApp(NSString * _Nullable bundleID,
+                                                                                 NSString * _Nullable appName,
+                                                                                 NSString * _Nullable workspaceRoot);
+
+FOUNDATION_EXPORT NSArray<InputMirrorSkillItem *> *InputMirrorLoadConversationMentionsForApp(NSString * _Nullable bundleID,
+                                                                                             NSString * _Nullable appName,
+                                                                                             NSString * _Nullable homeDirOverride);
+
+FOUNDATION_EXPORT NSArray<InputMirrorSkillItem *> *InputMirrorFilterSkills(NSArray<InputMirrorSkillItem *> *skills,
+                                                                           NSString * _Nullable query);
+
 @interface InputMirrorPanel : NSPanel
 @end
 
@@ -75,6 +113,9 @@ FOUNDATION_EXPORT NSAttributedString *InputMirrorFormatAttributedText(NSString *
 @property(nonatomic, copy, nullable) void (^onSubmit)(void);
 @property(nonatomic, copy, nullable) void (^onCancelEdit)(void);
 @property(nonatomic, copy, nullable) void (^onCompositionChanged)(void);
+@property(nonatomic, copy, nullable) BOOL (^onSkillMenuKeyDown)(NSEvent *event);
+@property(nonatomic, copy, nullable) void (^onNativeSlashHandoffShortcut)(void);
+@property(nonatomic, copy, nullable) void (^onNativeMentionHandoffShortcut)(void);
 @end
 
 @interface InputMirrorController : NSObject <NSWindowDelegate, NSTextViewDelegate>
@@ -84,14 +125,22 @@ FOUNDATION_EXPORT NSAttributedString *InputMirrorFormatAttributedText(NSString *
 @property(nonatomic, copy) NSSet<NSString *> *excludedAppTokens;
 @property(nonatomic) InputMirrorStyle style;
 @property(nonatomic, readonly) BOOL visible;
+@property(nonatomic, readonly) BOOL skillMenuVisible;
 @property(nonatomic, readonly) BOOL awaitingUserClickAfterJump;
+@property(nonatomic, readonly) BOOL hasUnsyncedEdits;
 @property(nonatomic, strong, readonly) InputMirrorPanel *panel;
 @property(nonatomic, strong, readonly) InputMirrorTextView *textView;
 @property(nonatomic, copy, readonly) NSString *mirroredText;
 @property(nonatomic, readonly) NSRange mirroredSelection;
 @property(nonatomic, copy, readonly) NSString *targetAppName;
+@property(nonatomic, copy, readonly) NSString *targetBundleID;
+@property(nonatomic, copy, nullable) NSArray<InputMirrorSkillItem *> *overrideSkillsForTesting;
+@property(nonatomic, copy, nullable) NSArray<InputMirrorSkillItem *> *overrideMentionsForTesting;
+@property(nonatomic, copy, nullable) NSString *overrideWorkspaceRootForTesting;
 @property(nonatomic, copy) NSString *defaultsKeyPrefix;
 @property(nonatomic, copy, nullable) void (^onSyncBack)(NSString *text, BOOL shouldSend);
+@property(nonatomic, copy, nullable) void (^onNativeSlashHandoff)(NSString *text);
+@property(nonatomic, copy, nullable) void (^onNativeMentionHandoff)(NSString *text);
 
 - (instancetype)init;
 - (void)showPreviewSample;
@@ -102,9 +151,20 @@ FOUNDATION_EXPORT NSAttributedString *InputMirrorFormatAttributedText(NSString *
                    appIcon:(NSImage * _Nullable)appIcon;
 - (void)adjustHeightToFitContentAnimated:(BOOL)animated;
 - (void)syncAndSend;
+- (void)handoffToNativeSlashMenu;
+- (void)handoffToNativeMentionMenu;
 - (void)dismissTemporarily;
 - (void)suppressAutoPopupUntilNextClick;
 - (void)handleExternalMouseClick;
+- (void)handleActiveSpaceChange;
+- (BOOL)reconcileExternalFocusText:(NSString *)text
+                         selection:(NSRange)selection
+                          bundleID:(NSString *)bundleID
+                           appName:(NSString *)appName
+                               pid:(pid_t)pid
+                           appIcon:(NSImage * _Nullable)appIcon
+                        sameTarget:(BOOL)sameTarget;
+- (NSString * _Nullable)savedDraftTextForBundleID:(NSString *)bundleID appName:(NSString *)appName pid:(pid_t)pid;
 - (void)stop;
 @end
 

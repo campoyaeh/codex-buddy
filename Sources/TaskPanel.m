@@ -403,6 +403,7 @@ static NSScrollView *PanelScrollView(NSRect frame, CGFloat documentHeight) {
 @property BOOL completionPulse;
 @property(strong) NSMutableSet *removingTasks;
 @property(strong) NSMutableSet *openingTasks;
+@property(strong) NSMutableSet *expandedTasks;
 @property(strong) NSMutableDictionary *dismissed;
 @property(strong) NSWindow *integrationsWindow;
 @property(strong) NSTask *integrationSetup;
@@ -449,6 +450,7 @@ static OSStatus MirrorHotKeyCallback(EventHandlerCallRef nextHandler, EventRef t
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.removingTasks = [NSMutableSet set];
     self.openingTasks = [NSMutableSet set];
+    self.expandedTasks = [NSMutableSet set];
     self.dismissed = [ReadJSON(@"dismissed.json") mutableCopy] ?: [NSMutableDictionary dictionary];
     self.collapsed = YES;
     self.historyLimit = 10;
@@ -616,7 +618,24 @@ static OSStatus MirrorHotKeyCallback(EventHandlerCallRef nextHandler, EventRef t
     for (NSDictionary *task in incoming) {
         BOOL active = [@[@"running", @"waiting", @"completed"] containsObject:task[@"status"]];
         BOOL dismissed = [self.dismissed[task[@"id"]] isEqual:DismissalKey(task)];
-        if (active && !dismissed) [tasks addObject:task];
+        if (!active || dismissed) continue;
+        NSArray *rawSubs = [task[@"subtasks"] isKindOfClass:NSArray.class] ? task[@"subtasks"] : nil;
+        if (rawSubs.count) {
+            NSMutableArray *filteredSubs = [NSMutableArray array];
+            for (NSDictionary *sub in rawSubs) {
+                BOOL subActive = [@[@"running", @"waiting", @"completed"] containsObject:sub[@"status"]];
+                BOOL subDismissed = [self.dismissed[sub[@"id"]] isEqual:DismissalKey(sub)];
+                if (subActive && !subDismissed) [filteredSubs addObject:sub];
+            }
+            if (filteredSubs.count != rawSubs.count) {
+                NSMutableDictionary *copy = [task mutableCopy];
+                if (filteredSubs.count) copy[@"subtasks"] = filteredSubs;
+                else [copy removeObjectForKey:@"subtasks"];
+                [tasks addObject:copy];
+                continue;
+            }
+        }
+        [tasks addObject:task];
     }
     NSString *error = snapshot[@"error"] ?: @"";
     if (!snapshot || snapshotStale) error = @"正在连接任务状态…";
@@ -953,11 +972,42 @@ static OSStatus MirrorHotKeyCallback(EventHandlerCallRef nextHandler, EventRef t
         NSString *project = [entry[@"project"] isKindOfClass:NSString.class] ? [entry[@"project"] lowercaseString] : @"";
         NSString *source = [entry[@"source"] isKindOfClass:NSString.class] ? [entry[@"source"] lowercaseString] : @"";
         NSString *provider = [entry[@"provider"] isKindOfClass:NSString.class] ? [entry[@"provider"] lowercaseString] : @"";
-        if ([title containsString:q] || [project containsString:q] || [source containsString:q] || [provider containsString:q]) {
-            [matches addObject:entry];
+        BOOL matched = ([title containsString:q] || [project containsString:q] || [source containsString:q] || [provider containsString:q]);
+        if (!matched && [entry[@"subtasks"] isKindOfClass:NSArray.class]) {
+            for (NSDictionary *sub in entry[@"subtasks"]) {
+                NSString *st = [sub[@"title"] isKindOfClass:NSString.class] ? [sub[@"title"] lowercaseString] : @"";
+                NSString *sp = [sub[@"project"] isKindOfClass:NSString.class] ? [sub[@"project"] lowercaseString] : @"";
+                NSString *ss = [sub[@"source"] isKindOfClass:NSString.class] ? [sub[@"source"] lowercaseString] : @"";
+                NSString *sv = [sub[@"provider"] isKindOfClass:NSString.class] ? [sub[@"provider"] lowercaseString] : @"";
+                if ([st containsString:q] || [sp containsString:q] || [ss containsString:q] || [sv containsString:q]) {
+                    matched = YES;
+                    break;
+                }
+            }
         }
+        if (matched) [matches addObject:entry];
     }
     return matches;
+}
+- (NSDictionary *)findTaskByID:(NSString *)threadID inList:(NSArray *)list {
+    if (!threadID.length) return nil;
+    for (NSDictionary *entry in list) {
+        if ([entry[@"id"] isEqual:threadID]) return entry;
+        NSArray *subs = [entry[@"subtasks"] isKindOfClass:NSArray.class] ? entry[@"subtasks"] : nil;
+        for (NSDictionary *sub in subs) {
+            if ([sub[@"id"] isEqual:threadID]) return sub;
+        }
+    }
+    return nil;
+}
+- (void)toggleSubtasks:(TaskButton *)sender {
+    NSString *threadID = sender.threadID;
+    if (!threadID.length) return;
+    if ([self.expandedTasks containsObject:threadID]) [self.expandedTasks removeObject:threadID];
+    else [self.expandedTasks addObject:threadID];
+    self.animateResize = YES;
+    [self rebuild];
+    self.animateResize = NO;
 }
 - (void)controlTextDidChange:(NSNotification *)obj {
     if (obj.object == self.historySearchField) {
@@ -1068,8 +1118,7 @@ static OSStatus MirrorHotKeyCallback(EventHandlerCallRef nextHandler, EventRef t
 }
 - (void)openTask:(TaskButton *)sender {
     if ([self.removingTasks containsObject:sender.threadID] || [self.openingTasks containsObject:sender.threadID]) return;
-    NSDictionary *task = nil;
-    for (NSDictionary *entry in self.showingHistory ? self.history : self.tasks) if ([entry[@"id"] isEqual:sender.threadID]) task = entry;
+    NSDictionary *task = [self findTaskByID:sender.threadID inList:self.showingHistory ? self.history : self.tasks];
     if (!task) return;
     [self.inputMirror suppressAutoPopupUntilNextClick];
     if (!self.preview && [task[@"provider"] isEqual:@"antigravity"]) {
@@ -1136,18 +1185,15 @@ static OSStatus MirrorHotKeyCallback(EventHandlerCallRef nextHandler, EventRef t
     if ([task[@"status"] isEqual:@"running"]) return;
     // A successful jump acknowledges this panel's reminder, including app-only
     // navigation. A later turn or status must survive a delayed launch callback.
-    for (NSDictionary *current in self.tasks) {
-        if ([current[@"id"] isEqual:task[@"id"]] && [current[@"turn"] isEqual:task[@"turn"]] && [current[@"status"] isEqual:task[@"status"]]) {
-            [self dismissEntry:current row:row];
-            return;
-        }
+    NSDictionary *current = [self findTaskByID:task[@"id"] inList:self.tasks];
+    if (current && [current[@"turn"] isEqual:task[@"turn"]] && [current[@"status"] isEqual:task[@"status"]]) {
+        [self dismissEntry:current row:row];
+        return;
     }
 }
 - (void)markTaskRead:(NSMenuItem *)sender {
-    for (NSDictionary *task in self.tasks) if ([task[@"id"] isEqual:sender.representedObject]) {
-        [self dismissEntry:task row:nil allowRunning:YES];
-        return;
-    }
+    NSDictionary *task = [self findTaskByID:sender.representedObject inList:self.tasks];
+    if (task) [self dismissEntry:task row:nil allowRunning:YES];
 }
 - (void)copyResume:(NSMenuItem *)sender {
     [NSPasteboard.generalPasteboard clearContents];
@@ -1304,6 +1350,12 @@ static NSInteger SourceSortRank(NSDictionary *source) {
     NSString *threadID = task[@"id"];
     NSMutableDictionary *dismissed = [ReadJSON(@"dismissed.json") mutableCopy] ?: [NSMutableDictionary dictionary];
     dismissed[threadID] = DismissalKey(task);
+    NSArray *childTasks = [task[@"subtasks"] isKindOfClass:NSArray.class] ? task[@"subtasks"] : nil;
+    for (NSDictionary *sub in childTasks) {
+        if (allowRunning || ![sub[@"status"] isEqual:@"running"]) {
+            dismissed[sub[@"id"]] = DismissalKey(sub);
+        }
+    }
     NSData *data = [NSJSONSerialization dataWithJSONObject:dismissed options:0 error:NULL];
     NSError *error;
     if (![data writeToFile:[DataDirectory() stringByAppendingPathComponent:@"dismissed.json"] options:NSDataWritingAtomic error:&error]) {
@@ -1318,11 +1370,28 @@ static NSInteger SourceSortRank(NSDictionary *source) {
         row.animator.alphaValue = 0;
         [row.animator setFrame:NSOffsetRect(row.frame, 18, 0)];
     } completionHandler:^{
-        NSMutableArray *remaining = [self.tasks mutableCopy];
-        NSIndexSet *matches = [remaining indexesOfObjectsPassingTest:^BOOL(NSDictionary *entry, NSUInteger idx, BOOL *stop) {
-            return [entry[@"id"] isEqual:threadID] && [DismissalKey(entry) isEqual:DismissalKey(task)];
-        }];
-        [remaining removeObjectsAtIndexes:matches];
+        NSMutableArray *remaining = [NSMutableArray array];
+        for (NSDictionary *entry in self.tasks) {
+            if ([entry[@"id"] isEqual:threadID] && [DismissalKey(entry) isEqual:DismissalKey(task)]) {
+                continue;
+            }
+            NSArray *subs = [entry[@"subtasks"] isKindOfClass:NSArray.class] ? entry[@"subtasks"] : nil;
+            if (subs.count) {
+                NSMutableArray *keptSubs = [NSMutableArray array];
+                for (NSDictionary *sub in subs) {
+                    if ([sub[@"id"] isEqual:threadID] && [DismissalKey(sub) isEqual:DismissalKey(task)]) continue;
+                    [keptSubs addObject:sub];
+                }
+                if (keptSubs.count != subs.count) {
+                    NSMutableDictionary *copy = [entry mutableCopy];
+                    if (keptSubs.count) copy[@"subtasks"] = keptSubs;
+                    else [copy removeObjectForKey:@"subtasks"];
+                    [remaining addObject:copy];
+                    continue;
+                }
+            }
+            [remaining addObject:entry];
+        }
         self.tasks = remaining;
         if (!remaining.count && !self.showingHistory) self.collapsed = YES;
         [self.removingTasks removeObject:threadID];
@@ -1342,6 +1411,10 @@ static NSInteger SourceSortRank(NSDictionary *source) {
     NSInteger waiting = 0;
     for (NSDictionary *task in self.tasks) {
         if ([task[@"status"] isEqual:@"waiting"]) waiting++;
+        NSArray *subs = [task[@"subtasks"] isKindOfClass:NSArray.class] ? task[@"subtasks"] : nil;
+        for (NSDictionary *sub in subs) {
+            if ([sub[@"status"] isEqual:@"waiting"]) waiting++;
+        }
     }
     self.statusItem.button.image = MascotImage(self.celebration.settings[@"mascotID"],20);
     self.statusItem.button.imagePosition = NSImageLeft;
@@ -1356,7 +1429,15 @@ static NSInteger SourceSortRank(NSDictionary *source) {
     NSArray *displayed = self.showingHistory ? [historyPool subarrayWithRange:NSMakeRange(0,MIN(self.historyLimit,historyPool.count))] : self.tasks;
     BOOL hasMore = self.showingHistory && historyPool.count > displayed.count;
     CGFloat width = self.collapsed ? 206 : 360;
-    CGFloat rowsHeight = displayed.count * 38 + (hasMore ? 32 : 0);
+    CGFloat rowsHeight = 0;
+    for (NSDictionary *task in displayed) {
+        rowsHeight += 38;
+        NSArray *subs = [task[@"subtasks"] isKindOfClass:NSArray.class] ? task[@"subtasks"] : nil;
+        if (subs.count && [self.expandedTasks containsObject:task[@"id"]]) {
+            rowsHeight += subs.count * 32 + 2;
+        }
+    }
+    if (hasMore) rowsHeight += 32;
     CGFloat searchHeight = (!self.collapsed && self.showingHistory) ? 32 : 0;
     CGFloat toastHeight = (!self.collapsed && self.toastMessage.length) ? 34 : 0;
     CGFloat noticeHeight = self.antigravityNotice.length ? 48 : 0;
@@ -1537,11 +1618,13 @@ static NSInteger SourceSortRank(NSDictionary *source) {
     [scroll.contentView scrollToPoint:NSMakePoint(0,MIN(previousScroll,MAX(0,rowsHeight-listHeight)))];
     [scroll reflectScrolledClipView:scroll.contentView];
     [root addSubview:scroll];
-    NSInteger index = 0;
+    CGFloat y = 0;
     for (NSDictionary *task in displayed) {
-        CGFloat y = (index++)*38;
         BOOL needsInput = [task[@"status"] isEqual:@"waiting"];
         BOOL completed = [task[@"status"] isEqual:@"completed"];
+        NSArray *subtasks = [task[@"subtasks"] isKindOfClass:NSArray.class] ? task[@"subtasks"] : nil;
+        BOOL hasSubtasks = subtasks.count > 0;
+        BOOL isExpanded = hasSubtasks && [self.expandedTasks containsObject:task[@"id"]];
         NSColor *color = StatusColor(task[@"status"]);
         PanelSurface *row = [[PanelSurface alloc] initWithFrame:NSMakeRect(0,y,rowWidth,34)];
         row.fillColor = [color colorWithAlphaComponent:0.055];
@@ -1576,7 +1659,8 @@ static NSInteger SourceSortRank(NSDictionary *source) {
         open.alignment = NSTextAlignmentLeft;
         open.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
         BOOL hasSource = [task[@"source"] length] > 0;
-        open.frame = NSMakeRect(23,0,rowWidth-(hasSource ? 58 : 28),34);
+        CGFloat rightReserve = (hasSource ? 58 : 28) + (hasSubtasks ? 42 : 0);
+        open.frame = NSMakeRect(23,0,MAX(40, rowWidth - rightReserve),34);
         open.toolTip = [NSString stringWithFormat:@"%@%@%@",task[@"source"] ?: @"Codex",@" · ",task[@"title"] ?: @""];
         if ([task[@"navigation"] isEqual:@"application"]) open.toolTip = [open.toolTip stringByAppendingString:[task[@"status"] isEqual:@"running"] ? @"\n点击返回应用；运行中任务继续保留" : @"\n点击返回应用并标为已读"];
         if (self.showingHistory) {
@@ -1590,6 +1674,34 @@ static NSInteger SourceSortRank(NSDictionary *source) {
         open.menu = rowMenu;
         open.accessibilityLabel = [NSString stringWithFormat:@"%@，打开聊天 %@", self.showingHistory ? @"历史对话" : needsInput ? @"待输入" : (completed ? @"已完成" : @"进行中"), open.title];
         [row addSubview:open];
+        if (hasSubtasks) {
+            BOOL subWaiting = NO;
+            NSInteger subRunning = 0;
+            for (NSDictionary *sub in subtasks) {
+                if ([sub[@"status"] isEqual:@"waiting"]) subWaiting = YES;
+                else if ([sub[@"status"] isEqual:@"running"]) subRunning++;
+            }
+            CGFloat pillX = hasSource ? (rowWidth - 70) : (rowWidth - 44);
+            PanelSurface *pill = [[PanelSurface alloc] initWithFrame:NSMakeRect(pillX, 7, 38, 20)];
+            NSColor *pillTint = (!self.showingHistory && subWaiting) ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+            pill.fillColor = [pillTint colorWithAlphaComponent:(!self.showingHistory && subWaiting) ? 0.18 : 0.10];
+            pill.layer.cornerRadius = 10;
+            [row addSubview:pill];
+            NSString *pillTitle = [NSString stringWithFormat:@"%@ %lu", isExpanded ? @"▾" : @"▸", (unsigned long)subtasks.count];
+            TaskButton *toggle = [TaskButton buttonWithTitle:pillTitle target:self action:@selector(toggleSubtasks:)];
+            toggle.threadID = task[@"id"];
+            toggle.bordered = NO;
+            toggle.alignment = NSTextAlignmentCenter;
+            toggle.font = [NSFont monospacedDigitSystemFontOfSize:10.5 weight:NSFontWeightMedium];
+            toggle.contentTintColor = (!self.showingHistory && subWaiting) ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+            toggle.frame = NSMakeRect(0, 0, 38, 20);
+            NSString *subDetail = (!self.showingHistory && subRunning > 0)
+                ? [NSString stringWithFormat:@"（含 %ld 个进行中）", (long)subRunning]
+                : @"";
+            toggle.toolTip = [NSString stringWithFormat:@"%lu 个协同子任务%@，点击%@", (unsigned long)subtasks.count, subDetail, isExpanded ? @"收起" : @"展开"];
+            toggle.accessibilityLabel = toggle.toolTip;
+            [pill addSubview:toggle];
+        }
         if (hasSource) {
             NSImageView *source = [[NSImageView alloc] initWithFrame:NSMakeRect(rowWidth-28,7,20,20)];
             source.image = SourceIcon(task);
@@ -1609,12 +1721,80 @@ static NSInteger SourceSortRank(NSDictionary *source) {
             flash.duration = 0.8;
             [row.layer addAnimation:flash forKey:@"completionHighlight"];
         }
+        y += 38;
+        if (isExpanded) {
+            CGFloat childX = 18;
+            CGFloat childWidth = rowWidth - childX;
+            PanelSurface *connector = [[PanelSurface alloc] initWithFrame:NSMakeRect(11, y - 4, 1.5, subtasks.count * 32 - 12)];
+            connector.fillColor = [NSColor.separatorColor colorWithAlphaComponent:0.45];
+            connector.layer.cornerRadius = 0.75;
+            [document addSubview:connector];
+            for (NSDictionary *sub in subtasks) {
+                BOOL subNeedsInput = [sub[@"status"] isEqual:@"waiting"];
+                BOOL subCompleted = [sub[@"status"] isEqual:@"completed"];
+                NSColor *subColor = StatusColor(sub[@"status"]);
+                PanelSurface *subRow = [[PanelSurface alloc] initWithFrame:NSMakeRect(childX, y, childWidth, 28)];
+                subRow.fillColor = [subColor colorWithAlphaComponent:0.045];
+                subRow.layer.cornerRadius = 6;
+                NSMenu *subMenu = [NSMenu new];
+                if (!self.showingHistory) {
+                    NSString *subMenuTitle = [@"running" isEqual:sub[@"status"]] ? @"移出列表" : @"标为已读";
+                    NSMenuItem *subRead = [subMenu addItemWithTitle:subMenuTitle action:@selector(markTaskRead:) keyEquivalent:@""];
+                    subRead.target = self; subRead.representedObject = sub[@"id"];
+                }
+                if ([sub[@"resume_command"] length]) {
+                    NSMenuItem *subResume = [subMenu addItemWithTitle:@"复制会话恢复命令" action:@selector(copyResume:) keyEquivalent:@""];
+                    subResume.target = self; subResume.representedObject = sub[@"resume_command"];
+                }
+                subRow.menu = subMenu;
+                [document addSubview:subRow];
+                if (!self.showingHistory && subNeedsInput) {
+                    ApplyWaitingRowAnimation(subRow, self.panel.effectiveAppearance);
+                }
+                PanelSurface *subDot = StatusDot(sub[@"status"], NSMakeRect(9, 11, 6, 6));
+                if (self.showingHistory) {
+                    subDot.fillColor = NSColor.tertiaryLabelColor;
+                    subDot.toolTip = @"历史协同子任务";
+                }
+                [subRow addSubview:subDot];
+                if (!self.showingHistory && subNeedsInput) {
+                    ApplyWaitingDotAnimation(subDot, self.panel.effectiveAppearance);
+                }
+                TaskButton *subOpen = [TaskButton buttonWithTitle:sub[@"title"] ?: @"协同子任务" target:self action:@selector(openTask:)];
+                subOpen.threadID = sub[@"id"];
+                subOpen.bordered = NO;
+                subOpen.alignment = NSTextAlignmentLeft;
+                subOpen.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
+                subOpen.contentTintColor = NSColor.secondaryLabelColor;
+                BOOL subHasSource = [sub[@"source"] length] > 0;
+                subOpen.frame = NSMakeRect(20, 0, MAX(40, childWidth - (subHasSource ? 46 : 24)), 28);
+                subOpen.toolTip = [NSString stringWithFormat:@"协同子任务 · %@ · %@", sub[@"source"] ?: @"", sub[@"title"] ?: @""];
+                if ([sub[@"provider"] isEqual:@"antigravity"]) {
+                    subOpen.toolTip = [subOpen.toolTip stringByAppendingString:@"\n点击打开对应对话"];
+                }
+                subOpen.menu = subMenu;
+                subOpen.accessibilityLabel = [NSString stringWithFormat:@"协同子任务，%@，%@", self.showingHistory ? @"历史" : subNeedsInput ? @"待输入" : (subCompleted ? @"已完成" : @"进行中"), subOpen.title];
+                [subRow addSubview:subOpen];
+                if (subHasSource) {
+                    NSImageView *subSource = [[NSImageView alloc] initWithFrame:NSMakeRect(childWidth - 22, 6, 16, 16)];
+                    subSource.image = SourceIcon(sub);
+                    subSource.imageScaling = NSImageScaleProportionallyUpOrDown;
+                    subSource.contentTintColor = NSColor.secondaryLabelColor;
+                    subSource.toolTip = sub[@"source"];
+                    subSource.accessibilityElement = YES;
+                    subSource.accessibilityLabel = [NSString stringWithFormat:@"应用：%@", sub[@"source"]];
+                    [subRow addSubview:subSource];
+                }
+                y += 32;
+            }
+            y += 2;
+        }
     }
     if (hasMore) {
         TaskButton *more = [TaskButton buttonWithTitle:@"再显示 10 条" target:self action:@selector(loadMoreHistory:)];
         more.bordered = NO;
         more.font = [NSFont systemFontOfSize:12];
-        more.frame = NSMakeRect(0,displayed.count*38,rowWidth,30);
+        more.frame = NSMakeRect(0,y,rowWidth,30);
         [document addSubview:more];
     }
 }
@@ -2084,6 +2264,318 @@ int main(int argc, const char *argv[]) {
                 NSCAssert(controller.inputMirror.style == InputMirrorStyleTerminal, @"Style selector must update mirror style");
                 CelebrationController *styleReloaded = [[CelebrationController alloc] initWithDirectory:DataDirectory()];
                 NSCAssert([styleReloaded.settings[@"inputMirrorStyle"] integerValue] == InputMirrorStyleTerminal, @"Selected input mirror style must persist");
+
+                // 7c. Slash / dollar skill autocomplete & native menu handoff
+                NSString *parsedQuery = nil;
+                InputMirrorSkillTrigger trig1 = InputMirrorParseSkillTrigger(@"/git", NSMakeRange(4, 0), &parsedQuery);
+                NSCAssert(trig1.active && trig1.triggerChar == '/' && NSEqualRanges(trig1.tokenRange, NSMakeRange(0, 4)) && [parsedQuery isEqualToString:@"git"], @"Leading /query must trigger skill picker");
+                InputMirrorSkillTrigger trig2 = InputMirrorParseSkillTrigger(@"请用 /prd 帮我写", NSMakeRange(7, 0), &parsedQuery);
+                NSCAssert(trig2.active && trig2.triggerChar == '/' && NSEqualRanges(trig2.tokenRange, NSMakeRange(3, 4)) && [parsedQuery isEqualToString:@"prd"], @"Mid-sentence /query after space must trigger skill picker");
+                InputMirrorSkillTrigger trig3 = InputMirrorParseSkillTrigger(@"https://example.com", NSMakeRange(19, 0), &parsedQuery);
+                NSCAssert(!trig3.active, @"URL must not trigger skill picker");
+                InputMirrorSkillTrigger trig4 = InputMirrorParseSkillTrigger(@"/Users/yeah", NSMakeRange(11, 0), &parsedQuery);
+                NSCAssert(!trig4.active, @"File path must not trigger skill picker");
+                InputMirrorSkillTrigger trig5 = InputMirrorParseSkillTrigger(@"$m5", NSMakeRange(3, 0), &parsedQuery);
+                NSCAssert(trig5.active && trig5.triggerChar == '$' && [parsedQuery isEqualToString:@"m5"], @"Dollar trigger must activate skill picker");
+
+                // Temp directory SKILL.md scanning & fuzzy/Chinese filtering
+                NSString *tmpSkillHome = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"im-skill-test-%d", getpid()]];
+                NSString *tmpGitSkillDir = [tmpSkillHome stringByAppendingPathComponent:@".codex/skills/git-sync"];
+                NSString *tmpSysSkillDir = [tmpSkillHome stringByAppendingPathComponent:@".codex/skills/.system/imagegen"];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpGitSkillDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpSysSkillDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [@"---\nname: git-sync\ndescription: 同步 GitHub 仓库与分支\n---\nBody" writeToFile:[tmpGitSkillDir stringByAppendingPathComponent:@"SKILL.md"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [@"---\nname: \"imagegen\"\ndescription: \"Generate bitmap visuals\"\n---\n" writeToFile:[tmpSysSkillDir stringByAppendingPathComponent:@"SKILL.md"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                NSArray<InputMirrorSkillItem *> *loadedSkills = InputMirrorLoadSkillsForApp(@"com.openai.codex", @"Codex", tmpSkillHome);
+                NSCAssert(loadedSkills.count == 2, @"Must scan user and .system Codex skills");
+                NSArray<InputMirrorSkillItem *> *fuzzyHits = InputMirrorFilterSkills(loadedSkills, @"gs");
+                NSCAssert(fuzzyHits.count == 1 && [fuzzyHits.firstObject.name isEqualToString:@"git-sync"], @"Subsequence fuzzy match must find git-sync");
+                NSArray<InputMirrorSkillItem *> *zhHits = InputMirrorFilterSkills(loadedSkills, @"仓库");
+                NSCAssert(zhHits.count == 1 && [zhHits.firstObject.name isEqualToString:@"git-sync"], @"Chinese description search must match git-sync");
+                [NSFileManager.defaultManager removeItemAtPath:tmpSkillHome error:nil];
+
+                // Interactive popover selection, Esc dismissal & native handoff
+                controller.inputMirror.overrideSkillsForTesting = loadedSkills;
+                __block NSString *handoffCaptured = nil;
+                controller.inputMirror.onNativeSlashHandoff = ^(NSString *text) {
+                    handoffCaptured = text;
+                };
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"帮我 /git" selection:NSMakeRange(7, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert(controller.inputMirror.skillMenuVisible, @"Typing /git must display skill picker popover");
+                // Esc closes ONLY skill popover, not mirror panel
+                NSEvent *escKey = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil characters:@"\x1b" charactersIgnoringModifiers:@"\x1b" isARepeat:NO keyCode:53];
+                [controller.inputMirror.textView keyDown:escKey];
+                NSCAssert(!controller.inputMirror.skillMenuVisible && controller.inputMirror.visible, @"Esc must close only skill menu while keeping input mirror open");
+
+                // Re-trigger and confirm with Enter -> inserts "$git-sync "
+                [controller.inputMirror updateMirroredText:@"帮我 /g" selection:NSMakeRange(5, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(5, 0)];
+                [controller.inputMirror.textView insertText:@"i" replacementRange:NSMakeRange(NSNotFound, 0)];
+                NSCAssert(controller.inputMirror.skillMenuVisible, @"Typing /gi must open skill menu");
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"帮我 $git-sync "], @"Enter on skill menu must replace /gi with $git-sync ");
+                NSCAssert(!controller.inputMirror.skillMenuVisible && controller.inputMirror.visible, @"Confirming skill must close popover and keep panel open");
+
+                // Unmatched /command still offers native handoff row and Enter triggers handoff
+                [controller.inputMirror updateMirroredText:@"/model" selection:NSMakeRange(6, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert(controller.inputMirror.skillMenuVisible, @"Unmatched /command must still show native handoff action");
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert([handoffCaptured isEqualToString:@"/model"] && !controller.inputMirror.visible, @"Confirming native handoff must pass /model and hide mirror panel");
+
+                // Price like $100 must NOT open skill menu
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"价格 $100" selection:NSMakeRange(7, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert(!controller.inputMirror.skillMenuVisible, @"Unmatched $100 must not open skill popover");
+
+                // Cmd+/ shortcut directly triggers native slash handoff with appended /
+                handoffCaptured = nil;
+                [controller.inputMirror updateMirroredText:@"请检查" selection:NSMakeRange(3, 0) appName:@"Codex" appIcon:nil];
+                NSEvent *cmdSlash = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:0 context:nil characters:@"/" charactersIgnoringModifiers:@"/" isARepeat:NO keyCode:44];
+                BOOL handledCmdSlash = [controller.inputMirror.textView performKeyEquivalent:cmdSlash];
+                NSCAssert(handledCmdSlash && [handoffCaptured isEqualToString:@"请检查 /"], @"Cmd+/ must hand off to native slash menu with trailing /");
+                controller.inputMirror.overrideSkillsForTesting = nil;
+                controller.inputMirror.onNativeSlashHandoff = nil;
+
+                // 7d. @ mention parsing, multi-app compatibility, workspace file discovery & native @ handoff
+                InputMirrorSkillTrigger atTrig1 = InputMirrorParseSkillTrigger(@"@Input", NSMakeRange(6, 0), &parsedQuery);
+                NSCAssert(atTrig1.active && atTrig1.triggerChar == '@' && NSEqualRanges(atTrig1.tokenRange, NSMakeRange(0, 6)) && [parsedQuery isEqualToString:@"Input"], @"Leading @query must trigger mention picker");
+                InputMirrorSkillTrigger atTrig2 = InputMirrorParseSkillTrigger(@"帮我看看 @Sources/Input", NSMakeRange(19, 0), &parsedQuery);
+                NSCAssert(atTrig2.active && atTrig2.triggerChar == '@' && NSEqualRanges(atTrig2.tokenRange, NSMakeRange(5, 14)) && [parsedQuery isEqualToString:@"Sources/Input"], @"@path/to/file with inner slash must trigger mention picker");
+                InputMirrorSkillTrigger atTrig3 = InputMirrorParseSkillTrigger(@"帮我看看@Task", NSMakeRange(9, 0), &parsedQuery);
+                NSCAssert(atTrig3.active && atTrig3.triggerChar == '@' && NSEqualRanges(atTrig3.tokenRange, NSMakeRange(4, 5)) && [parsedQuery isEqualToString:@"Task"], @"Chinese text followed directly by @query must trigger mention picker");
+                InputMirrorSkillTrigger atTrigEmail = InputMirrorParseSkillTrigger(@"user@example.com", NSMakeRange(16, 0), &parsedQuery);
+                NSCAssert(!atTrigEmail.active, @"Email address must not trigger @ mention picker");
+                InputMirrorSkillTrigger atTrigEmail2 = InputMirrorParseSkillTrigger(@"foo.bar@test.io", NSMakeRange(15, 0), &parsedQuery);
+                NSCAssert(!atTrigEmail2.active, @"Dotted email address must not trigger @ mention picker");
+
+                // Multi-app built-in @ mentions & workspace file scanning
+                NSString *tmpWsRoot = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"im-mention-ws-%d", getpid()]];
+                NSString *tmpSrcDir = [tmpWsRoot stringByAppendingPathComponent:@"Sources"];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpSrcDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [@"int main() { return 0; }\n" writeToFile:[tmpSrcDir stringByAppendingPathComponent:@"InputMirror.m"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [@"# Readme\n" writeToFile:[tmpWsRoot stringByAppendingPathComponent:@"README.md"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+                NSArray<InputMirrorSkillItem *> *cursorMentions = InputMirrorLoadMentionsForApp(@"com.todesktop.230313mzl4w4u92", @"Cursor", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(cursorMentions, @"Codebase").count >= 1, @"Cursor must provide built-in @Codebase mention");
+                NSArray<InputMirrorSkillItem *> *fileHits = InputMirrorFilterSkills(cursorMentions, @"Input");
+                NSCAssert(fileHits.count >= 1 && [fileHits.firstObject.name isEqualToString:@"Sources/InputMirror.m"] && [fileHits.firstObject.insertPrefix isEqualToString:@"@"], @"Basename prefix search must rank Sources/InputMirror.m first");
+
+                NSArray<InputMirrorSkillItem *> *vscodeMentions = InputMirrorLoadMentionsForApp(@"com.microsoft.vscode", @"Visual Studio Code", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(vscodeMentions, @"workspace").count >= 1, @"VS Code must provide built-in @workspace mention");
+                NSArray<InputMirrorSkillItem *> *windsurfMentions = InputMirrorLoadMentionsForApp(@"com.exafunction.windsurf", @"Windsurf", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(windsurfMentions, @"mcp").count >= 1, @"Windsurf must provide built-in @mcp mention");
+                NSArray<InputMirrorSkillItem *> *traeMentions = InputMirrorLoadMentionsForApp(@"com.trae.app", @"TRAE", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(traeMentions, @"Builder").count >= 1, @"TRAE must provide built-in @Builder mention");
+                NSArray<InputMirrorSkillItem *> *codebuddyMentions = InputMirrorLoadMentionsForApp(@"com.tencent.codebuddy", @"CodeBuddy", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(codebuddyMentions, @"codebase").count >= 1, @"CodeBuddy must provide built-in @codebase mention");
+                NSArray<InputMirrorSkillItem *> *qoderMentions = InputMirrorLoadMentionsForApp(@"com.alibaba.qoder", @"Qoder", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(qoderMentions, @"workspace").count >= 1, @"Qoder must provide built-in @workspace mention");
+                NSArray<InputMirrorSkillItem *> *opencodeMentions = InputMirrorLoadMentionsForApp(@"ai.opencode.desktop", @"OpenCode", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(opencodeMentions, @"explore").count >= 1, @"OpenCode must provide built-in @explore mention");
+                NSArray<InputMirrorSkillItem *> *agMentions = InputMirrorLoadMentionsForApp(@"com.google.antigravity", @"Antigravity", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(agMentions, @"Files").count >= 1 && InputMirrorFilterSkills(agMentions, @"README").count >= 1, @"Antigravity must provide built-in mentions and workspace files");
+                NSArray<InputMirrorSkillItem *> *codexMentions = InputMirrorLoadMentionsForApp(@"com.openai.codex", @"Codex", tmpWsRoot);
+                NSCAssert(InputMirrorFilterSkills(codexMentions, @"InputMirror").count >= 1, @"Codex must discover workspace files for @ mention");
+
+                // Workspace root resolution from Codex global state & VSCode-style storage.json
+                NSString *tmpResolverHome = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"im-ws-resolve-%d", getpid()]];
+                NSString *tmpCodexDir = [tmpResolverHome stringByAppendingPathComponent:@".codex"];
+                NSString *tmpCursorStorageDir = [tmpResolverHome stringByAppendingPathComponent:@"Library/Application Support/Cursor/User/globalStorage"];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpCodexDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpCursorStorageDir withIntermediateDirectories:YES attributes:nil error:nil];
+                NSDictionary *codexState = @{
+                    @"electron-owner-value:selected-project:test": @{ @"type": @"local", @"projectId": @"proj-1" },
+                    @"local-projects": @{ @"proj-1": @{ @"id": @"proj-1", @"rootPaths": @[tmpWsRoot] } }
+                };
+                NSData *codexStateData = [NSJSONSerialization dataWithJSONObject:codexState options:0 error:nil];
+                [codexStateData writeToFile:[tmpCodexDir stringByAppendingPathComponent:@".codex-global-state.json"] atomically:YES];
+                NSDictionary *cursorStorage = @{
+                    @"windowsState": @{ @"lastActiveWindow": @{ @"folder": [NSURL fileURLWithPath:tmpWsRoot].absoluteString } }
+                };
+                NSData *cursorStorageData = [NSJSONSerialization dataWithJSONObject:cursorStorage options:0 error:nil];
+                [cursorStorageData writeToFile:[tmpCursorStorageDir stringByAppendingPathComponent:@"storage.json"] atomically:YES];
+                NSString *resolvedCodexWs = InputMirrorResolveWorkspaceRootForApp(@"com.openai.codex", @"Codex", tmpResolverHome);
+                NSString *resolvedCursorWs = InputMirrorResolveWorkspaceRootForApp(@"com.todesktop.230313mzl4w4u92", @"Cursor", tmpResolverHome);
+                NSCAssert([resolvedCodexWs isEqualToString:tmpWsRoot], @"Must resolve Codex active workspace root from .codex-global-state.json");
+                NSCAssert([resolvedCursorWs isEqualToString:tmpWsRoot], @"Must resolve Cursor active workspace root from storage.json");
+                [NSFileManager.defaultManager removeItemAtPath:tmpResolverHome error:nil];
+                [NSFileManager.defaultManager removeItemAtPath:tmpWsRoot error:nil];
+
+                // Interactive @ popover selection, unmatched native @ handoff & Cmd+Shift+2 shortcut
+                controller.inputMirror.overrideMentionsForTesting = codexMentions;
+                __block NSString *mentionHandoffCaptured = nil;
+                controller.inputMirror.onNativeMentionHandoff = ^(NSString *text) {
+                    mentionHandoffCaptured = text;
+                };
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"请检查 @Input" selection:NSMakeRange(10, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert(controller.inputMirror.skillMenuVisible, @"Typing @Input must display mention picker popover");
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"请检查 @Sources/InputMirror.m "], @"Enter on @ mention menu must replace @Input with @Sources/InputMirror.m ");
+                NSCAssert(!controller.inputMirror.skillMenuVisible && controller.inputMirror.visible, @"Confirming @ mention must close popover and keep panel open");
+
+                // Unmatched @query offers native @ handoff and Enter triggers it
+                [controller.inputMirror updateMirroredText:@"引用 @未命中项" selection:NSMakeRange(8, 0) appName:@"Antigravity" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert(controller.inputMirror.skillMenuVisible, @"Unmatched @query must still show native @ handoff action");
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert([mentionHandoffCaptured isEqualToString:@"引用 @未命中项"] && !controller.inputMirror.visible, @"Confirming native @ handoff must pass @query and hide mirror panel");
+
+                // Cmd+Shift+2 (Cmd+@) shortcut directly triggers native @ handoff with appended @
+                mentionHandoffCaptured = nil;
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"请检查" selection:NSMakeRange(3, 0) appName:@"Cursor" appIcon:nil];
+                NSEvent *cmdAt = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:(NSEventModifierFlagCommand | NSEventModifierFlagShift) timestamp:0 windowNumber:0 context:nil characters:@"@" charactersIgnoringModifiers:@"2" isARepeat:NO keyCode:19];
+                BOOL handledCmdAt = [controller.inputMirror.textView performKeyEquivalent:cmdAt];
+                NSCAssert(handledCmdAt && [mentionHandoffCaptured isEqualToString:@"请检查 @"], @"Cmd+Shift+2 must hand off to native @ menu with trailing @");
+
+                // Conversation @ mentions loaded from snapshot.json trigger native @ handoff on Enter
+                NSString *tmpConvHome = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"im-conv-test-%d", getpid()]];
+                NSString *tmpTaskMgrDir = [tmpConvHome stringByAppendingPathComponent:@".codex/task-manager"];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpTaskMgrDir withIntermediateDirectories:YES attributes:nil error:nil];
+                NSDictionary *snapPayload = @{
+                    @"tasks": @[
+                        @{ @"provider": @"antigravity", @"title": @"修复登录超时问题", @"project": @"Codex任务管理器", @"updated": @(2000.0) },
+                        @{ @"provider": @"codex", @"title": @"Codex 独立会话", @"project": @"other", @"updated": @(3000.0) }
+                    ],
+                    @"history": @[
+                        @{ @"provider": @"antigravity", @"title": @"优化输入镜像浮窗", @"project": @"Codex任务管理器", @"updated": @(1500.0) }
+                    ]
+                };
+                NSData *snapData = [NSJSONSerialization dataWithJSONObject:snapPayload options:0 error:nil];
+                [snapData writeToFile:[tmpTaskMgrDir stringByAppendingPathComponent:@"snapshot.json"] atomically:YES];
+                NSArray<InputMirrorSkillItem *> *agConvs = InputMirrorLoadConversationMentionsForApp(@"com.google.antigravity", @"Antigravity", tmpConvHome);
+                [NSFileManager.defaultManager removeItemAtPath:tmpConvHome error:nil];
+                NSCAssert(agConvs.count == 2 && [agConvs.firstObject.name isEqualToString:@"修复登录超时问题"] && agConvs.firstObject.requiresNativeHandoff && [agConvs.firstObject.sourceLabel isEqualToString:@"对话"], @"Must load provider-filtered conversation mentions sorted by recency with requiresNativeHandoff");
+                mentionHandoffCaptured = nil;
+                controller.inputMirror.overrideMentionsForTesting = agConvs;
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"请参考 @登录" selection:NSMakeRange(7, 0) appName:@"Antigravity" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert(controller.inputMirror.skillMenuVisible, @"Typing @登录 must match conversation mention");
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert([mentionHandoffCaptured isEqualToString:@"请参考 @修复登录超时问题"] && !controller.inputMirror.visible, @"Selecting a conversation mention must hand off @<title> to native @ picker");
+
+                // Conversation title with spaces must extract a space-free native query token without appending duplicate @
+                InputMirrorSkillItem *spacedConv = [[InputMirrorSkillItem alloc] init];
+                spacedConv.name = @"App Mention Feature Compatibility";
+                spacedConv.summary = @"对话 · Codex任务管理器 · 回车在原应用绑定";
+                spacedConv.insertPrefix = @"@";
+                spacedConv.sourceLabel = @"对话";
+                spacedConv.requiresNativeHandoff = YES;
+                mentionHandoffCaptured = nil;
+                controller.inputMirror.overrideMentionsForTesting = @[spacedConv];
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"请参考 @Mention" selection:NSMakeRange(12, 0) appName:@"Antigravity" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert(controller.inputMirror.skillMenuVisible, @"Typing @Mention must match spaced conversation title");
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert([mentionHandoffCaptured isEqualToString:@"请参考 @Compatibility"] && !controller.inputMirror.visible, @"Spaced conversation title must hand off a single space-free query token without duplicate @");
+
+                controller.inputMirror.overrideMentionsForTesting = nil;
+                controller.inputMirror.overrideWorkspaceRootForTesting = nil;
+                controller.inputMirror.onNativeMentionHandoff = nil;
+
+                // 7e. Draft protection across Space switch, focus loss, multi-app switching & false likelySent prevention
+                controller.inputMirror.onSyncBack = nil;
+                BOOL sent0 = [controller.inputMirror reconcileExternalFocusText:@""
+                                                                      selection:NSMakeRange(0, 0)
+                                                                       bundleID:@"com.openai.codex"
+                                                                        appName:@"Codex"
+                                                                            pid:41001
+                                                                        appIcon:nil
+                                                                     sameTarget:NO];
+                NSCAssert(!sent0, @"Initial empty focus must not be treated as sent");
+                [controller.inputMirror.panel orderFrontRegardless];
+                [controller.inputMirror.textView setString:@"这是一段很长的输入内容，切桌面绝对不能丢"];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(8, 0)];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert(controller.inputMirror.hasUnsyncedEdits, @"Typing in mirror must mark unsynced edits");
+                NSCAssert([[controller.inputMirror savedDraftTextForBundleID:@"com.openai.codex" appName:@"Codex" pid:41001] isEqualToString:@"这是一段很长的输入内容，切桌面绝对不能丢"], @"Typing in mirror must immediately persist draft for target app");
+
+                // Losing key focus (e.g. clicking outside) must NOT wipe text or falsely trigger likelySent on empty AX read
+                [controller.inputMirror windowDidResignKey:[NSNotification notificationWithName:NSWindowDidResignKeyNotification object:controller.inputMirror.panel]];
+                BOOL sentAfterResign = [controller.inputMirror reconcileExternalFocusText:@""
+                                                                              selection:NSMakeRange(0, 0)
+                                                                               bundleID:@"com.openai.codex"
+                                                                                appName:@"Codex"
+                                                                                    pid:41001
+                                                                                appIcon:nil
+                                                                             sameTarget:YES];
+                NSCAssert(!sentAfterResign, @"Empty AX read while unsynced draft exists must NEVER trigger likelySent");
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"这是一段很长的输入内容，切桌面绝对不能丢"], @"Resign + empty AX poll must preserve typed text");
+
+                // Desktop / Space switch hides panel cleanly but preserves draft; returning to AI app restores exact text & cursor
+                [controller.inputMirror handleActiveSpaceChange];
+                NSCAssert(!controller.inputMirror.visible, @"Space switch must hide floating mirror cleanly");
+                NSCAssert([[controller.inputMirror savedDraftTextForBundleID:@"com.openai.codex" appName:@"Codex" pid:41001] isEqualToString:@"这是一段很长的输入内容，切桌面绝对不能丢"], @"Space switch must preserve unsynced draft");
+                BOOL sentAfterSpace = [controller.inputMirror reconcileExternalFocusText:@""
+                                                                             selection:NSMakeRange(0, 0)
+                                                                              bundleID:@"com.openai.codex"
+                                                                               appName:@"Codex"
+                                                                                   pid:41001
+                                                                               appIcon:nil
+                                                                            sameTarget:NO];
+                NSCAssert(!sentAfterSpace && [controller.inputMirror.textView.string isEqualToString:@"这是一段很长的输入内容，切桌面绝对不能丢"] && controller.inputMirror.textView.selectedRange.location == 8 && controller.inputMirror.hasUnsyncedEdits, @"Returning after Space switch must restore exact draft, cursor position, and pending sync flag");
+
+                // Multi-app isolation: switching to Antigravity keeps Codex draft intact and maintains Antigravity's own draft
+                [controller.inputMirror reconcileExternalFocusText:@""
+                                                         selection:NSMakeRange(0, 0)
+                                                          bundleID:@"com.google.antigravity"
+                                                           appName:@"Antigravity"
+                                                               pid:41002
+                                                           appIcon:nil
+                                                        sameTarget:NO];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@""], @"Switching to a different AI app without a draft must start clean");
+                [controller.inputMirror.textView setString:@"Antigravity 独立草稿"];
+                [controller.inputMirror.textView setSelectedRange:NSMakeRange(16, 0)];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                // Switch back to Codex -> Codex draft restored
+                [controller.inputMirror reconcileExternalFocusText:@""
+                                                         selection:NSMakeRange(0, 0)
+                                                          bundleID:@"com.openai.codex"
+                                                           appName:@"Codex"
+                                                               pid:41001
+                                                           appIcon:nil
+                                                        sameTarget:NO];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"这是一段很长的输入内容，切桌面绝对不能丢"], @"Switching back to Codex must restore Codex draft");
+                // Switch back to Antigravity -> Antigravity draft restored
+                [controller.inputMirror reconcileExternalFocusText:@""
+                                                         selection:NSMakeRange(0, 0)
+                                                          bundleID:@"com.google.antigravity"
+                                                           appName:@"Antigravity"
+                                                               pid:41002
+                                                           appIcon:nil
+                                                        sameTarget:NO];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"Antigravity 独立草稿"], @"Switching back to Antigravity must restore Antigravity draft");
+
+                // Deliberately deleting all text clears the draft (must not resurrect deleted text)
+                [controller.inputMirror.textView setString:@""];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSCAssert([controller.inputMirror savedDraftTextForBundleID:@"com.google.antigravity" appName:@"Antigravity" pid:41002] == nil, @"Clearing all text in mirror must clear saved draft");
+
+                // Sending via Enter clears Codex draft
+                [controller.inputMirror reconcileExternalFocusText:@""
+                                                         selection:NSMakeRange(0, 0)
+                                                          bundleID:@"com.openai.codex"
+                                                           appName:@"Codex"
+                                                               pid:41001
+                                                           appIcon:nil
+                                                        sameTarget:NO];
+                __block NSString *draftSentText = nil;
+                controller.inputMirror.onSyncBack = ^(NSString *text, BOOL shouldSend) {
+                    if (shouldSend) draftSentText = text;
+                };
+                [controller.inputMirror syncAndSend];
+                NSCAssert([draftSentText isEqualToString:@"这是一段很长的输入内容，切桌面绝对不能丢"], @"Enter after draft restore must send the full restored draft");
+                NSCAssert([controller.inputMirror savedDraftTextForBundleID:@"com.openai.codex" appName:@"Codex" pid:41001] == nil, @"Sending must clear saved draft");
+                controller.inputMirror.onSyncBack = nil;
 
                 // 8. Auto-collapse (single-screen mode): default OFF, hover expand, 10s idle collapse, task change expand
                 NSCAssert(![controller isAutoCollapseEnabled], @"Auto-collapse must be disabled by default");

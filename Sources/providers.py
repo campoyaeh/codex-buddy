@@ -162,8 +162,34 @@ def reconcile_antigravity_tasks(home, history, entries=None):
                 entries.pop(key, None)
 
 
+def _deepseek_visible_sessions(home):
+    """Return session IDs visible in DeepSeek Harness desktop workspaces, or None if unavailable."""
+    path = home / '.dsh/storages/workspace.json'
+    if not path.is_file():
+        return None
+    data = read_json(path)
+    if not isinstance(data, dict):
+        return None
+    workspaces = data.get('tables', {}).get('workspaces')
+    if not isinstance(workspaces, dict):
+        return None
+    visible = set()
+    for workspace in workspaces.values():
+        if isinstance(workspace, dict):
+            for sid in workspace.get('sessionIds', ()):
+                if isinstance(sid, str) and sid:
+                    visible.add(sid)
+    archived = {
+        sid for sid in data.get('global', {}).get('archivedSessionIds', ())
+        if isinstance(sid, str) and sid
+    }
+    return visible - archived
+
+
 def deepseek_tasks(home):
     root = home / '.dsh/storages/session_projcache/sessions'
+    visible = _deepseek_visible_sessions(home)
+    cospan_jobs = None
     result = []
     for path in root.glob('session-*.json'):
         record = read_json(path, {}).get('record', {})
@@ -172,6 +198,12 @@ def deepseek_tasks(home):
             return rows.get(key, {}).get('val', default)
         if value('parentSessionId') or value('parent_session_id') or value('isSubagent'):
             continue
+        if visible is not None and path.stem not in visible:
+            if cospan_jobs is None:
+                cospan_jobs = load_cospan_jobs(home)
+            title = str(value('title') or '').lower()
+            if f'deepseek:{path.stem}' not in cospan_jobs and '[cospan delegation context]' not in title:
+                continue
         boundary = value('turnBoundary', {})
         questions = value('userQuestions', {}).get('questions', {}).get('active', [])
         open_turn = boundary.get('openTurnStartSeq')
@@ -430,7 +462,9 @@ def _native_provider_sig(provider, home):
         root = home / '.dsh/storages/session_projcache/sessions'
         if not root.exists():
             return None
-        return tuple(sorted((p.name, _file_sig(p)) for p in root.glob('session-*.json')))
+        ws_sig = _file_sig(home / '.dsh/storages/workspace.json')
+        sessions_sig = tuple(sorted((p.name, _file_sig(p)) for p in root.glob('session-*.json')))
+        return (ws_sig, _cospan_sig(home), sessions_sig)
     if provider == 'qianwen':
         sigs = []
         for idx in qianwen_session_indexes(home):
@@ -439,6 +473,142 @@ def _native_provider_sig(provider, home):
                 sigs.append((str(j), _file_sig(j)))
         return tuple(sorted(sigs))
     return None
+
+
+COSPAN_TARGET_PROVIDER = {
+    'agy': 'antigravity',
+    'antigravity': 'antigravity',
+    'dsh': 'deepseek',
+    'deepseek': 'deepseek',
+    'claude': 'claude',
+    'codex': 'codex',
+    'gemini': 'gemini',
+    'opencode': 'opencode',
+    'qwen': 'qwencode',
+    'qwencode': 'qwencode',
+    'kimi': 'kimi',
+    'cursor': 'cursor',
+    'codebuddy': 'codebuddy',
+    'minimax': 'minimax',
+}
+
+COSPAN_STOPPED_STATUSES = {'canceled', 'cancelled', 'failed', 'timeout', 'error', 'aborted'}
+
+
+def _cospan_sig(home):
+    root = home / '.cospan/trajectories'
+    if not root.exists():
+        return None
+    return tuple(sorted((str(p), _file_sig(p)) for p in root.glob('*/state.json')))
+
+
+def load_cospan_jobs(home):
+    root = home / '.cospan/trajectories'
+    if not root.exists():
+        return {}
+    by_task_id = {}
+    for path in sorted(root.glob('*/state.json')):
+        data = read_json(path, {})
+        if not isinstance(data, dict):
+            continue
+        for job in data.get('jobs', ()):
+            if not isinstance(job, dict):
+                continue
+            job_id = job.get('id')
+            conv = job.get('conversation_id')
+            if not job_id or not conv:
+                continue
+            target = str(job.get('target') or '').lower()
+            provider = COSPAN_TARGET_PROVIDER.get(target, target)
+            if not provider:
+                continue
+            task_id = str(conv) if provider == 'codex' else f'{provider}:{conv}'
+            started = parse_timestamp(job.get('started_at'))
+            previous = by_task_id.get(task_id)
+            if previous and previous.get('started', 0) > started:
+                continue
+            by_task_id[task_id] = {
+                'id': str(job_id),
+                'target': target,
+                'provider': provider,
+                'status': str(job.get('status') or '').lower(),
+                'model': str(job.get('model') or ''),
+                'cwd': str(job.get('cwd') or ''),
+                'caller_session_id': str(job.get('caller_session_id') or ''),
+                'started': started,
+            }
+    return by_task_id
+
+
+def _is_cospan_entry(key, entry, cospan_jobs):
+    if key in cospan_jobs:
+        return True
+    title = str(entry.get('title') or '').lower()
+    return '[cospan delegation context]' in title
+
+
+def _cospan_subtask_title(entry, job):
+    title = str(entry.get('title') or '')
+    if '[cospan delegation context]' not in title.lower():
+        return title
+    source = entry.get('source') or PRODUCTS.get(entry.get('provider'), ('协同子任务',))[0]
+    model = (job or {}).get('model') or ''
+    if '/' in model:
+        model = model.rsplit('/', 1)[-1]
+    return f'{source} · {model}' if model else f'{source} 协同子任务'
+
+
+def reconcile_cospan_statuses(cospan_jobs, history, entries):
+    if not cospan_jobs:
+        return
+    for key, entry in list(entries.items()):
+        job = cospan_jobs.get(key)
+        if not job:
+            continue
+        job_status = job.get('status')
+        if job_status in COSPAN_STOPPED_STATUSES and entry.get('status') in ('running', 'completed'):
+            entry['status'] = 'stopped'
+            entries.pop(key, None)
+            if key in history:
+                history[key]['status'] = 'stopped'
+        elif job_status == 'done' and entry.get('status') == 'running':
+            entry['status'] = 'completed'
+            if key in history:
+                history[key]['status'] = 'completed'
+
+
+def _find_cospan_parent(key, entry, pool, cospan_jobs, job_owners, updated_fn):
+    if not _is_cospan_entry(key, entry, cospan_jobs):
+        return None
+    job = cospan_jobs.get(key)
+    if job:
+        caller = job.get('caller_session_id')
+        if caller and caller != key and caller in pool:
+            return caller
+        owner = job_owners.get(job['id'])
+        if owner and owner != key and owner in pool:
+            return owner
+        # If this job has a known owner that is NOT in `pool`, don't misattribute it to another thread.
+        if owner or caller:
+            return None
+    # Fallback for brand-new cospan tasks before job_id/conversation_id links appear:
+    # match active Codex parent in the same project (preferring $prod-rd / cospan threads).
+    project = entry.get('project') or (Path(job['cwd']).name if job and job.get('cwd') else '')
+    if not project:
+        return None
+    candidates = [
+        (pid, pentry) for pid, pentry in pool.items()
+        if pid != key and pentry.get('provider') == 'codex' and pentry.get('project') == project
+    ]
+    if not candidates:
+        return None
+    def rank(item):
+        _, pentry = item
+        title = str(pentry.get('title') or '').lower()
+        is_collab = 1 if ('$prod-rd' in title or 'cospan' in title) else 0
+        return (is_collab, updated_fn(pentry))
+    candidates.sort(key=rank, reverse=True)
+    return candidates[0][0]
 
 
 class UnifiedMonitor:
@@ -465,6 +635,8 @@ class UnifiedMonitor:
         self._settings_sig = None
         self._disabled_providers = set()
         self._ag_db_sig = None
+        self._cospan_sig = None
+        self._cospan_jobs_cache = {}
         self._installed_changed = True
 
     def discover(self):
@@ -561,6 +733,13 @@ class UnifiedMonitor:
         elif any(e.get('provider') == 'antigravity' and e.get('status') == 'running' for e in self.entries.values()):
             any_changed = True
 
+        cospan_sig = _cospan_sig(self.home)
+        if cospan_sig != self._cospan_sig:
+            self._cospan_jobs_cache = load_cospan_jobs(self.home)
+            self._cospan_sig = cospan_sig
+            any_changed = True
+        cospan_jobs = self._cospan_jobs_cache
+
         # Fast path: nothing changed since last tick, just touch heartbeat!
         if not any_changed and (self.data / 'snapshot.json').exists():
             os.utime(self.data / 'snapshot.json', None)
@@ -631,6 +810,7 @@ class UnifiedMonitor:
             else:
                 entries.pop(entry['id'], None)
         reconcile_antigravity_tasks(self.home, history, entries)
+        reconcile_cospan_statuses(cospan_jobs, history, entries)
         if disabled_providers:
             entries = {k: v for k, v in entries.items() if v.get('provider') not in disabled_providers}
             history = {k: v for k, v in history.items() if v.get('provider') not in disabled_providers}
@@ -649,8 +829,6 @@ class UnifiedMonitor:
         priority = {'waiting': 0, 'completed': 1, 'running': 2}
         fields = {'id', 'turn', 'title', 'status', 'provider', 'source', 'navigation', 'navigation_id', 'open_url',
                   'app', 'bundle_id', 'resume_command', 'waiting_kind', 'stale', 'project'}
-        tasks = sorted([{k: v for k, v in entry.items() if k in fields} for entry in entries.values()],
-                       key=lambda v: (priority[v['status']], v.get('source', ''), v['title']))
         def updated(entry):
             value = entry.get('updated', 0)
             try:
@@ -661,8 +839,61 @@ class UnifiedMonitor:
                     return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
                 except ValueError:
                     return 0
-        self.history = [dict({k: v for k, v in entry.items() if k in fields}, updated=updated(entry))
-                        for entry in sorted(history.values(), key=lambda entry: (-updated(entry), entry['id']))]
+
+        # Resolve cospan job -> parent Codex thread ownership when any cospan jobs exist.
+        target_job_ids = {
+            cospan_jobs[k]['id']
+            for k in (set(entries) | set(history))
+            if k in cospan_jobs
+        }
+        job_owners = {}
+        if target_job_ids and self.codex and hasattr(self.codex, 'cospan_job_owners'):
+            job_owners = self.codex.cospan_job_owners(target_job_ids, active_ids=set(entries), history_ids=set(history))
+
+        # Group active cospan child tasks under their parent task.
+        active_subtasks = {}
+        top_entries = {}
+        for key, entry in entries.items():
+            parent_id = _find_cospan_parent(key, entry, entries, cospan_jobs, job_owners, updated)
+            if parent_id:
+                sub = {k: v for k, v in entry.items() if k in fields}
+                sub['title'] = _cospan_subtask_title(entry, cospan_jobs.get(key))
+                active_subtasks.setdefault(parent_id, []).append(sub)
+                continue
+            # Avoid leaving an already-completed cospan subtask orphaned at top-level
+            # when its parent task is not active (dismissed, archived, or unavailable).
+            if entry.get('status') == 'completed' and _is_cospan_entry(key, entry, cospan_jobs):
+                continue
+            top_entries[key] = entry
+
+        tasks = []
+        for key, entry in top_entries.items():
+            item = {k: v for k, v in entry.items() if k in fields}
+            subs = active_subtasks.get(key)
+            if subs:
+                item['subtasks'] = sorted(subs, key=lambda v: (priority[v['status']], v.get('source', ''), v['title']))
+            tasks.append(item)
+        tasks.sort(key=lambda v: (priority[v['status']], v.get('source', ''), v['title']))
+
+        # Group history cospan child tasks under their parent task as well.
+        history_subtasks = {}
+        top_history = {}
+        for key, entry in history.items():
+            parent_id = _find_cospan_parent(key, entry, history, cospan_jobs, job_owners, updated)
+            if parent_id:
+                sub = dict({k: v for k, v in entry.items() if k in fields}, updated=updated(entry))
+                sub['title'] = _cospan_subtask_title(entry, cospan_jobs.get(key))
+                history_subtasks.setdefault(parent_id, []).append(sub)
+                continue
+            top_history[key] = entry
+
+        self.history = []
+        for entry in sorted(top_history.values(), key=lambda entry: (-updated(entry), entry['id'])):
+            item = dict({k: v for k, v in entry.items() if k in fields}, updated=updated(entry))
+            subs = history_subtasks.get(entry['id'])
+            if subs:
+                item['subtasks'] = sorted(subs, key=lambda v: (-v.get('updated', 0), v['id']))
+            self.history.append(item)
         self.entries = entries
         self.source_errors = errors
         health = []
