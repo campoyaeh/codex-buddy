@@ -979,11 +979,15 @@ static PanelSurface *SettingsRowDivider(CGFloat x, CGFloat y, CGFloat width) {
         addToTab(choice, 0);
     }
 
-    // Row 2: 6 cutout preset avatars + 1 custom upload slot (7 cards across x=42..738)
+    // Row 2: 7 cutout preset avatars + 1 custom upload slot (8 cards across x=42..738)
     NSInteger presetIndex = 0;
-    for (NSDictionary *role in PresetAvatarCatalog()) {
-        CGFloat x = 42.0 + (presetIndex++) * 100.66;
-        MascotChoiceButton *choice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(round(x), 280, 92, 78)];
+    NSArray<NSDictionary *> *presets = PresetAvatarCatalog();
+    NSInteger totalRow2 = (NSInteger)presets.count + 1;
+    CGFloat row2CardW = 81.0;
+    CGFloat row2Step = totalRow2 > 1 ? (696.0 - row2CardW) / (CGFloat)(totalRow2 - 1) : 0.0;
+    for (NSDictionary *role in presets) {
+        CGFloat x = 42.0 + (presetIndex++) * row2Step;
+        MascotChoiceButton *choice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(round(x), 280, row2CardW, 78)];
         choice.mascotID = role[@"id"];
         choice.chosen = [role[@"id"] isEqual:self.settings[@"mascotID"]];
         choice.target = self; choice.action = @selector(changeMascot:);
@@ -994,7 +998,7 @@ static PanelSurface *SettingsRowDivider(CGFloat x, CGFloat y, CGFloat width) {
         addToTab(choice, 0);
     }
 
-    MascotChoiceButton *customChoice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(646, 280, 92, 78)];
+    MascotChoiceButton *customChoice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(round(42.0 + presetIndex * row2Step), 280, row2CardW, 78)];
     customChoice.mascotID = @"custom";
     customChoice.uploadPlaceholder = !MascotHasCustomAvatar();
     customChoice.chosen = (!customChoice.uploadPlaceholder && [@"custom" isEqual:self.settings[@"mascotID"]]);
@@ -1142,7 +1146,7 @@ static PanelSurface *SettingsRowDivider(CGFloat x, CGFloat y, CGFloat width) {
     addToTab(mirrorHint, 1);
     self.inputMirrorHint = mirrorHint;
 
-    NSTextField *mirrorDesc = [NSTextField wrappingLabelWithString:@"• 仅在 Codex、Antigravity、Cursor、Claude、千问、TRAE、CodeBuddy 等 AI 应用输入框弹出，不干扰其他软件\n• 支持跨屏拖动记忆、高度自适应、有序/无序列表格式、⌘A/C/V/Z 与 Enter 发送自动收起（自动排除密码框）"];
+    NSTextField *mirrorDesc = [NSTextField wrappingLabelWithString:@"• 仅在 Codex、Antigravity、Cursor、Claude、千问、TRAE、CodeBuddy 等 AI 应用输入框弹出，不干扰其他软件\n• 支持 📎 上传附件 / 拖拽文件 / ⌘V 粘贴截图、@ 与 / 联动、高度自适应与 Enter 发送自动收起"];
     mirrorDesc.font = [NSFont systemFontOfSize:12];
     mirrorDesc.textColor = NSColor.secondaryLabelColor;
     mirrorDesc.frame = NSMakeRect(44, 68, 692, 46);

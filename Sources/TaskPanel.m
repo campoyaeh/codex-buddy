@@ -1957,7 +1957,7 @@ int main(int argc, const char *argv[]) {
                     NSCAssert(png.length > 200, @"Rendered mascot/avatar PNG must be non-empty");
                     [artwork addObject:png];
                 }
-                NSCAssert(identifiers.count == 12 && artwork.count == 12, @"All 12 built-in mascots and cutout avatars must have distinct identifiers and artwork");
+                NSCAssert(identifiers.count == 13 && artwork.count == 13, @"All 13 built-in mascots and cutout avatars must have distinct identifiers and artwork");
 
                 // Test custom avatar import + automatic solid-background removal + persistence + clear
                 NSString *syntheticSrc = [DataDirectory() stringByAppendingPathComponent:@"synthetic-upload.png"];
@@ -1983,7 +1983,7 @@ int main(int argc, const char *argv[]) {
 
                 controller.collapsed = YES; [controller rebuild];
                 NSCAssert(controller.panel.frame.size.width == 206 && controller.panel.frame.size.height == 40, @"Identity changes must preserve compact capsule geometry");
-                puts("Mascots passed: 12 built-in designs, custom upload with auto background removal, persistence, menu and preview updates, and compact layout");
+                puts("Mascots passed: 13 built-in designs, custom upload with auto background removal, persistence, menu and preview updates, and compact layout");
                 return 0;
             }
             if ([args containsObject:@"--integration-ui-test"]) {
@@ -2712,6 +2712,52 @@ int main(int argc, const char *argv[]) {
                 NSCAssert([draftSentText isEqualToString:@"这是一段很长的输入内容，切桌面绝对不能丢"], @"Enter after draft restore must send the full restored draft");
                 NSCAssert([controller.inputMirror savedDraftTextForBundleID:@"com.openai.codex" appName:@"Codex" pid:41001] == nil, @"Sending must clear saved draft");
                 controller.inputMirror.onSyncBack = nil;
+
+                // 7f. Attachment upload, screenshot paste, deduplication, Space/app draft preservation & sync flush
+                NSString *tmpAttDoc = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"mirror-att-doc-%d.pdf", getpid()]];
+                [@"PDF-MOCK-DATA" writeToFile:tmpAttDoc atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                NSImage *mockShot = [NSImage imageWithSize:NSMakeSize(48, 48) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+                    [[NSColor colorWithSRGBRed:0.2 green:0.6 blue:0.95 alpha:1.0] setFill];
+                    NSRectFill(rect);
+                    return YES;
+                }];
+                [controller.inputMirror reconcileExternalFocusText:@"" selection:NSMakeRange(0, 0) bundleID:@"com.openai.codex" appName:@"Codex" pid:43001 appIcon:nil sameTarget:NO];
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"请分析附件" selection:NSMakeRange(5, 0) appName:@"Codex" appIcon:nil];
+                CGFloat baseMirrorH = NSHeight(controller.inputMirror.panel.frame);
+                NSCAssert([controller.inputMirror addAttachmentFromFileURL:[NSURL fileURLWithPath:tmpAttDoc]], @"Must attach local PDF file");
+                NSCAssert([controller.inputMirror addAttachmentFromFileURL:[NSURL fileURLWithPath:tmpAttDoc]] && controller.inputMirror.pendingAttachments.count == 1, @"Duplicate file path must be deduplicated");
+                NSCAssert([controller.inputMirror addAttachmentFromImage:mockShot suggestedName:@"截图1.png"] && controller.inputMirror.pendingAttachments.count == 2, @"Must attach clipboard screenshot PNG");
+                NSCAssert(controller.inputMirror.pendingAttachments[1].isImage && controller.inputMirror.pendingAttachments[1].thumbnail != nil, @"Image attachment must generate a preview thumbnail");
+                NSCAssert(NSHeight(controller.inputMirror.panel.frame) >= baseMirrorH + 40.0, @"Adding attachments must expand InputMirror height to show thumbnail strip");
+
+                // Removing first attachment leaves 1; Space switch preserves staged attachment per app
+                [controller.inputMirror removeAttachmentAtIndex:0];
+                NSCAssert(controller.inputMirror.pendingAttachments.count == 1 && [controller.inputMirror.pendingAttachments.firstObject.displayName isEqualToString:@"截图1.png"], @"Removing attachment 0 must keep remaining screenshot");
+                [controller.inputMirror reconcileExternalFocusText:@"请分析附件" selection:NSMakeRange(5, 0) bundleID:@"com.openai.codex" appName:@"Codex" pid:43001 appIcon:nil sameTarget:YES];
+                [controller.inputMirror addAttachmentFromImage:mockShot suggestedName:@"截图1.png"];
+                NSCAssert(controller.inputMirror.pendingAttachments.count == 1, @"Active session must hold 1 screenshot attachment");
+                [controller.inputMirror handleActiveSpaceChange];
+                [controller.inputMirror reconcileExternalFocusText:@"" selection:NSMakeRange(0, 0) bundleID:@"com.openai.codex" appName:@"Codex" pid:43001 appIcon:nil sameTarget:NO];
+                NSCAssert(controller.inputMirror.pendingAttachments.count == 1, @"Space switch must preserve pending attachments in draft");
+
+                __block NSString *attSentText = nil;
+                __block NSArray<InputMirrorAttachment *> *attSentItems = nil;
+                controller.inputMirror.onSyncBack = ^(NSString *text, BOOL shouldSend) {
+                    if (shouldSend) attSentText = text;
+                };
+                controller.inputMirror.onSyncAttachmentsBack = ^(NSArray<InputMirrorAttachment *> *attachments, BOOL shouldSend) {
+                    if (shouldSend) attSentItems = attachments;
+                };
+                [controller.inputMirror syncAndSend];
+                NSCAssert([attSentText isEqualToString:@"请分析附件"] && attSentItems.count == 1 && [attSentItems.firstObject.displayName isEqualToString:@"截图1.png"] && controller.inputMirror.pendingAttachments.count == 0,
+                          @"syncAndSend must deliver both text and staged attachments and clear pending list");
+                for (InputMirrorAttachment *att in attSentItems) {
+                    if (att.isTemporaryFile && att.fileURL) [NSFileManager.defaultManager removeItemAtURL:att.fileURL error:nil];
+                }
+                [NSFileManager.defaultManager removeItemAtPath:tmpAttDoc error:nil];
+                controller.inputMirror.onSyncBack = nil;
+                controller.inputMirror.onSyncAttachmentsBack = nil;
 
                 // 8. Auto-collapse (single-screen mode): default OFF, hover expand, 10s idle collapse, task change expand
                 NSCAssert(![controller isAutoCollapseEnabled], @"Auto-collapse must be disabled by default");

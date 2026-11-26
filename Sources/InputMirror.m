@@ -10,6 +10,7 @@ static const CGFloat kMirrorMinWidth = 380.0;
 static const CGFloat kMirrorMinHeight = 112.0;
 static const CGFloat kMirrorMaxHeight = 360.0;
 static const CGFloat kMirrorHeaderHeight = 34.0;
+static const CGFloat kMirrorAttachmentBarHeight = 46.0;
 static const CGFloat kMirrorBottomPadding = 12.0;
 static const CGFloat kMirrorBodyFontSize = 15.0;
 static const NSTimeInterval kMirrorPollInterval = 0.08;
@@ -2854,6 +2855,263 @@ NSArray<InputMirrorSkillItem *> *InputMirrorFilterSkills(NSArray<InputMirrorSkil
 - (BOOL)canBecomeMainWindow { return NO; }
 @end
 
+#pragma mark - Attachments Model, Drag Surface & Pill Views
+
+@implementation InputMirrorAttachment
+@end
+
+static NSString *IMFormatByteSize(unsigned long long bytes) {
+    if (bytes < 1024ULL) return [NSString stringWithFormat:@"%llu B", bytes];
+    if (bytes < 1024ULL * 1024ULL) return [NSString stringWithFormat:@"%.0f KB", MAX(1.0, (double)bytes / 1024.0)];
+    return [NSString stringWithFormat:@"%.1f MB", (double)bytes / (1024.0 * 1024.0)];
+}
+
+static BOOL IMIsRasterImageExtension(NSString *ext) {
+    NSString *lower = ext.lowercaseString ?: @"";
+    static NSSet<NSString *> *exts = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        exts = [NSSet setWithArray:@[@"png", @"jpg", @"jpeg", @"webp", @"heic", @"heif", @"bmp", @"tif", @"tiff"]];
+    });
+    return [exts containsObject:lower];
+}
+
+static BOOL IMIsAnyImageExtension(NSString *ext) {
+    NSString *lower = ext.lowercaseString ?: @"";
+    return IMIsRasterImageExtension(lower) || [lower isEqualToString:@"gif"] || [lower isEqualToString:@"svg"] || [lower isEqualToString:@"ico"];
+}
+
+static NSImage *IMMakeSquareThumbnail(NSImage *src, CGFloat side) {
+    if (!src || src.size.width <= 0 || src.size.height <= 0) return nil;
+    return [NSImage imageWithSize:NSMakeSize(side, side) flipped:NO drawingHandler:^BOOL(NSRect dstRect) {
+        [NSGraphicsContext currentContext].imageInterpolation = NSImageInterpolationHigh;
+        NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:dstRect xRadius:6.0 yRadius:6.0];
+        [clip addClip];
+        NSSize sz = src.size;
+        CGFloat scale = MAX(side / sz.width, side / sz.height);
+        CGFloat dw = sz.width * scale, dh = sz.height * scale;
+        NSRect drawRect = NSMakeRect((side - dw) * 0.5, (side - dh) * 0.5, dw, dh);
+        [src drawInRect:drawRect fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1.0];
+        return YES;
+    }];
+}
+
+static NSData *IMPNGDataFromImage(NSImage *image) {
+    if (!image) return nil;
+    NSRect r = NSMakeRect(0, 0, image.size.width, image.size.height);
+    CGImageRef cg = [image CGImageForProposedRect:&r context:nil hints:nil];
+    if (!cg) return nil;
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:cg];
+    return [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+}
+
+static InputMirrorAttachment * _Nullable IMCreateAttachmentFromFileURL(NSURL *fileURL, BOOL isTemporary) {
+    if (!fileURL || !fileURL.isFileURL) return nil;
+    NSString *path = fileURL.URLByStandardizingPath.path;
+    if (!path.length) return nil;
+    BOOL isDir = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&isDir] || isDir) return nil;
+
+    NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:NULL];
+    unsigned long long fsize = [attrs[NSFileSize] unsignedLongLongValue];
+    NSString *ext = path.pathExtension ?: @"";
+    BOOL isImg = IMIsAnyImageExtension(ext);
+
+    InputMirrorAttachment *att = [[InputMirrorAttachment alloc] init];
+    att.identifier = isTemporary ? NSUUID.UUID.UUIDString : path;
+    att.fileURL = [NSURL fileURLWithPath:path];
+    att.displayName = path.lastPathComponent.length ? path.lastPathComponent : @"附件";
+    NSString *typePrefix = isImg ? @"图片" : (ext.length ? ext.uppercaseString : @"文件");
+    att.sizeLabel = [NSString stringWithFormat:@"%@ · %@", typePrefix, IMFormatByteSize(fsize)];
+    att.isImage = isImg;
+    att.isTemporaryFile = isTemporary;
+
+    if (isImg) {
+        NSImage *loaded = [[NSImage alloc] initWithContentsOfFile:path];
+        att.thumbnail = IMMakeSquareThumbnail(loaded, 28.0);
+    }
+    if (!att.thumbnail) {
+        NSImage *icon = [NSWorkspace.sharedWorkspace iconForFile:path];
+        icon.size = NSMakeSize(28.0, 28.0);
+        att.thumbnail = icon;
+    }
+    return att;
+}
+
+static InputMirrorAttachment * _Nullable IMCreateAttachmentFromClipboardImage(NSImage *image, NSString * _Nullable suggestedName) {
+    NSData *png = IMPNGDataFromImage(image);
+    if (!png.length) return nil;
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"codex-buddy-mirror-attachments"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    static NSUInteger seq = 0;
+    seq++;
+    NSString *stem = suggestedName.length ? [suggestedName stringByDeletingPathExtension] : nil;
+    if (!stem.length) {
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"HHmmss";
+        stem = [NSString stringWithFormat:@"粘贴图片-%@-%lu", [df stringFromDate:[NSDate date]], (unsigned long)seq];
+    }
+    NSString *filename = [stem stringByAppendingPathExtension:@"png"];
+    NSString *fullPath = [dir stringByAppendingPathComponent:filename];
+    if (![png writeToFile:fullPath options:NSDataWritingAtomic error:NULL]) return nil;
+    return IMCreateAttachmentFromFileURL([NSURL fileURLWithPath:fullPath], YES);
+}
+
+static NSArray<NSURL *> *IMExtractDroppedOrPastedFileURLs(NSPasteboard *pb) {
+    if (!pb) return @[];
+    NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[NSURL.class]
+                                               options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    if (!urls.count) return @[];
+    NSMutableArray<NSURL *> *valid = [NSMutableArray arrayWithCapacity:urls.count];
+    for (NSURL *u in urls) {
+        BOOL isDir = NO;
+        if (u.isFileURL && [NSFileManager.defaultManager fileExistsAtPath:u.path isDirectory:&isDir] && !isDir) {
+            [valid addObject:u];
+        }
+    }
+    return valid;
+}
+
+@interface InputMirrorDropSurface : PanelSurface
+@property(nonatomic, copy, nullable) BOOL (^onReceiveFileURLs)(NSArray<NSURL *> *urls);
+@property(nonatomic, copy, nullable) BOOL (^onReceiveImage)(NSImage *image);
+@property(nonatomic, copy, nullable) void (^onDragHoverChanged)(BOOL hovering);
+@end
+
+@implementation InputMirrorDropSurface
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    if ((self = [super initWithFrame:frameRect])) {
+        [self registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
+    }
+    return self;
+}
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pb = [sender draggingPasteboard];
+    BOOL canAccept = (IMExtractDroppedOrPastedFileURLs(pb).count > 0) || [NSImage canInitWithPasteboard:pb];
+    if (canAccept && self.onDragHoverChanged) self.onDragHoverChanged(YES);
+    return canAccept ? NSDragOperationCopy : NSDragOperationNone;
+}
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pb = [sender draggingPasteboard];
+    BOOL canAccept = (IMExtractDroppedOrPastedFileURLs(pb).count > 0) || [NSImage canInitWithPasteboard:pb];
+    return canAccept ? NSDragOperationCopy : NSDragOperationNone;
+}
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+    if (self.onDragHoverChanged) self.onDragHoverChanged(NO);
+}
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    if (self.onDragHoverChanged) self.onDragHoverChanged(NO);
+    NSPasteboard *pb = [sender draggingPasteboard];
+    NSArray<NSURL *> *urls = IMExtractDroppedOrPastedFileURLs(pb);
+    if (urls.count > 0 && self.onReceiveFileURLs) {
+        return self.onReceiveFileURLs(urls);
+    }
+    if ([NSImage canInitWithPasteboard:pb] && self.onReceiveImage) {
+        NSImage *img = [[NSImage alloc] initWithPasteboard:pb];
+        if (img) return self.onReceiveImage(img);
+    }
+    return NO;
+}
+@end
+
+@interface InputMirrorAttachmentPillView : NSView
+@property(nonatomic, strong) InputMirrorAttachment *attachment;
+@property(nonatomic, strong) NSColor *fillColor;
+@property(nonatomic, strong) NSColor *borderColor;
+@property(nonatomic, strong) NSColor *textColor;
+@property(nonatomic, strong) NSColor *mutedColor;
+@property(nonatomic, copy, nullable) void (^onRemove)(void);
+@end
+
+@implementation InputMirrorAttachmentPillView {
+    NSRect _removeRect;
+    BOOL _hoverRemove;
+    NSTrackingArea *_trackingArea;
+}
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (_trackingArea) [self removeTrackingArea:_trackingArea];
+    _trackingArea = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                                 options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                                   owner:self
+                                                userInfo:nil];
+    [self addTrackingArea:_trackingArea];
+}
+- (void)mouseMoved:(NSEvent *)event {
+    NSPoint pt = [self convertPoint:event.locationInWindow fromView:nil];
+    BOOL inside = NSPointInRect(pt, NSInsetRect(_removeRect, -3, -3));
+    if (inside != _hoverRemove) {
+        _hoverRemove = inside;
+        [self setNeedsDisplay:YES];
+    }
+}
+- (void)mouseExited:(NSEvent *)event {
+    if (_hoverRemove) {
+        _hoverRemove = NO;
+        [self setNeedsDisplay:YES];
+    }
+}
+- (void)mouseDown:(NSEvent *)event {
+    NSPoint pt = [self convertPoint:event.locationInWindow fromView:nil];
+    if (NSPointInRect(pt, NSInsetRect(_removeRect, -4, -4))) {
+        if (self.onRemove) self.onRemove();
+    }
+}
+- (void)drawRect:(NSRect)dirtyRect {
+    NSRect cardRect = NSInsetRect(self.bounds, 0.5, 0.5);
+    NSBezierPath *card = [NSBezierPath bezierPathWithRoundedRect:cardRect xRadius:9.0 yRadius:9.0];
+    [(self.fillColor ?: [NSColor colorWithWhite:1.0 alpha:0.08]) setFill];
+    [card fill];
+    [(self.borderColor ?: [NSColor colorWithWhite:1.0 alpha:0.18]) setStroke];
+    card.lineWidth = 0.85;
+    [card stroke];
+
+    if (self.attachment.thumbnail) {
+        [self.attachment.thumbnail drawInRect:NSMakeRect(5.0, 5.0, 28.0, 28.0)
+                                     fromRect:NSZeroRect
+                                    operation:NSCompositingOperationSourceOver
+                                     fraction:1.0];
+    }
+
+    CGFloat textX = 38.0;
+    CGFloat maxTextW = MAX(40.0, self.bounds.size.width - textX - 26.0);
+    NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+    ps.lineBreakMode = NSLineBreakByTruncatingMiddle;
+
+    NSDictionary *nameAttrs = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: self.textColor ?: NSColor.labelColor,
+        NSParagraphStyleAttributeName: ps
+    };
+    [self.attachment.displayName ?: @"附件" drawInRect:NSMakeRect(textX, 18.5, maxTextW, 15.0) withAttributes:nameAttrs];
+
+    NSDictionary *subAttrs = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:9.5 weight:NSFontWeightRegular],
+        NSForegroundColorAttributeName: self.mutedColor ?: NSColor.secondaryLabelColor,
+        NSParagraphStyleAttributeName: ps
+    };
+    [self.attachment.sizeLabel ?: @"" drawInRect:NSMakeRect(textX, 4.5, maxTextW, 13.0) withAttributes:subAttrs];
+
+    _removeRect = NSMakeRect(self.bounds.size.width - 21.0, (self.bounds.size.height - 16.0) * 0.5, 16.0, 16.0);
+    if (_hoverRemove) {
+        [[(self.mutedColor ?: NSColor.secondaryLabelColor) colorWithAlphaComponent:0.22] setFill];
+        [[NSBezierPath bezierPathWithOvalInRect:_removeRect] fill];
+    }
+    NSColor *xColor = _hoverRemove ? (self.textColor ?: NSColor.labelColor) : (self.mutedColor ?: NSColor.secondaryLabelColor);
+    [xColor setStroke];
+    NSBezierPath *xPath = [NSBezierPath bezierPath];
+    CGFloat cx = NSMidX(_removeRect), cy = NSMidY(_removeRect), d = 3.3;
+    [xPath moveToPoint:NSMakePoint(cx - d, cy - d)];
+    [xPath lineToPoint:NSMakePoint(cx + d, cy + d)];
+    [xPath moveToPoint:NSMakePoint(cx - d, cy + d)];
+    [xPath lineToPoint:NSMakePoint(cx + d, cy - d)];
+    xPath.lineWidth = 1.35;
+    xPath.lineCapStyle = NSLineCapStyleRound;
+    [xPath stroke];
+}
+@end
+
 #pragma mark - Smart List Editing Helpers
 
 typedef NS_ENUM(NSInteger, IMListLineKind) {
@@ -3217,7 +3475,62 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
     return YES;
 }
 
-// Accessory apps have no Edit menu, so explicitly handle standard Cmd+A/C/V/X/Z/Shift+Z & Cmd+/ shortcuts!
+// Accessory apps have no Edit menu, so explicitly handle standard Cmd+A/C/V/X/Z/Shift+Z, Cmd+U attach & Cmd+/ shortcuts!
+- (void)paste:(id)sender {
+    NSPasteboard *pb = NSPasteboard.generalPasteboard;
+    NSArray<NSURL *> *fileURLs = IMExtractDroppedOrPastedFileURLs(pb);
+    if (fileURLs.count > 0 && self.onPasteFileURLs && self.onPasteFileURLs(fileURLs)) {
+        return;
+    }
+    NSString *plainText = [pb stringForType:NSPasteboardTypeString];
+    if (plainText.length == 0 && [NSImage canInitWithPasteboard:pb] && self.onPasteImage) {
+        NSImage *img = [[NSImage alloc] initWithPasteboard:pb];
+        if (img && self.onPasteImage(img)) {
+            return;
+        }
+    }
+    [super paste:sender];
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pb = [sender draggingPasteboard];
+    BOOL canAccept = (IMExtractDroppedOrPastedFileURLs(pb).count > 0) || [NSImage canInitWithPasteboard:pb];
+    if (canAccept) {
+        if (self.onDragHoverChanged) self.onDragHoverChanged(YES);
+        return NSDragOperationCopy;
+    }
+    return [super draggingEntered:sender];
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pb = [sender draggingPasteboard];
+    if (IMExtractDroppedOrPastedFileURLs(pb).count > 0 || [NSImage canInitWithPasteboard:pb]) {
+        return NSDragOperationCopy;
+    }
+    return [super draggingUpdated:sender];
+}
+
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+    if (self.onDragHoverChanged) self.onDragHoverChanged(NO);
+    [super draggingExited:sender];
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    if (self.onDragHoverChanged) self.onDragHoverChanged(NO);
+    NSPasteboard *pb = [sender draggingPasteboard];
+    NSArray<NSURL *> *urls = IMExtractDroppedOrPastedFileURLs(pb);
+    if (urls.count > 0 && self.onPasteFileURLs && self.onPasteFileURLs(urls)) {
+        return YES;
+    }
+    if ([NSImage canInitWithPasteboard:pb] && self.onPasteImage) {
+        NSImage *img = [[NSImage alloc] initWithPasteboard:pb];
+        if (img && self.onPasteImage(img)) {
+            return YES;
+        }
+    }
+    return [super performDragOperation:sender];
+}
+
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
     if (event.type == NSEventTypeKeyDown) {
         NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
@@ -3229,6 +3542,12 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
             if ([key isEqualToString:@"c"]) { [self copy:nil]; return YES; }
             if ([key isEqualToString:@"v"]) { [self paste:nil]; return YES; }
             if ([key isEqualToString:@"x"]) { [self cut:nil]; return YES; }
+            if ([key isEqualToString:@"u"]) {
+                if (self.onOpenAttachmentPickerShortcut) {
+                    self.onOpenAttachmentPickerShortcut();
+                    return YES;
+                }
+            }
             if ([key isEqualToString:@"z"]) {
                 if (self.undoManager.canUndo) [self.undoManager undo];
                 return YES;
@@ -3249,6 +3568,12 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
             if ([key isEqualToString:@"z"]) {
                 if (self.undoManager.canRedo) [self.undoManager redo];
                 return YES;
+            }
+            if ([key isEqualToString:@"a"]) {
+                if (self.onOpenAttachmentPickerShortcut) {
+                    self.onOpenAttachmentPickerShortcut();
+                    return YES;
+                }
             }
             if ([key isEqualToString:@"2"] || [key isEqualToString:@"@"] || event.keyCode == kVK_ANSI_2) {
                 if (self.onNativeMentionHandoffShortcut) {
@@ -3471,6 +3796,7 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
 @property(nonatomic) NSRange selection;
 @property(nonatomic, copy) NSString *baseTargetText;
 @property(nonatomic, copy) NSSet<NSString *> *confirmedChips;
+@property(nonatomic, copy) NSArray<InputMirrorAttachment *> *attachments;
 @property(nonatomic) NSTimeInterval savedAt;
 @end
 
@@ -3481,14 +3807,20 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
 @property(nonatomic, strong, readwrite) InputMirrorPanel *panel;
 @property(nonatomic, strong, readwrite) InputMirrorTextView *textView;
 @property(nonatomic, strong) NSScrollView *scrollView;
+@property(nonatomic, strong) NSScrollView *attachmentScrollView;
+@property(nonatomic, strong) NSView *attachmentContainer;
 @property(nonatomic, strong) NSVisualEffectView *glassView;
-@property(nonatomic, strong) PanelSurface *cardSurface;
+@property(nonatomic, strong) InputMirrorDropSurface *cardSurface;
 @property(nonatomic, strong) NSView *dragPill;
 @property(nonatomic, strong) NSView *statusDot;
 @property(nonatomic, strong) NSImageView *appIconView;
 @property(nonatomic, strong) NSTextField *titleLabel;
 @property(nonatomic, strong) NSTextField *countLabel;
+@property(nonatomic, strong) NSButton *attachButton;
 @property(nonatomic, strong) NSButton *closeButton;
+@property(nonatomic, strong) NSMutableArray<InputMirrorAttachment *> *pendingAttachmentList;
+@property(nonatomic, assign) BOOL attachmentPickerOpen;
+@property(nonatomic, assign) BOOL dragHovering;
 @property(nonatomic, copy, readwrite) NSString *mirroredText;
 @property(nonatomic, readwrite) NSRange mirroredSelection;
 @property(nonatomic, copy, readwrite) NSString *targetAppName;
@@ -3579,6 +3911,7 @@ static void IMAxObserverCallback(AXObserverRef observer, AXUIElementRef element,
         _manualAXPids = [NSMutableSet set];
         _unsyncedDrafts = [NSMutableDictionary dictionary];
         _confirmedChipSet = [NSMutableSet set];
+        _pendingAttachmentList = [NSMutableArray array];
         _skillMenuItems = @[];
         _skillMenuRowViews = @[];
         _skillMenuCategoryTabViews = @[];
@@ -3612,11 +3945,15 @@ static void IMAxObserverCallback(AXObserverRef observer, AXUIElementRef element,
 }
 
 - (BOOL)hasUnsyncedEdits {
-    return self.hasLocalEditsPendingSync;
+    return self.hasLocalEditsPendingSync || self.pendingAttachmentList.count > 0;
 }
 
 - (NSSet<NSString *> *)confirmedChipTokens {
     return [self.confirmedChipSet copy] ?: [NSSet set];
+}
+
+- (NSArray<InputMirrorAttachment *> *)pendingAttachments {
+    return [self.pendingAttachmentList copy] ?: @[];
 }
 
 #pragma mark - Unsynced Draft Protection
@@ -3642,8 +3979,10 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     if (!key.length) return;
     NSString *text = self.textView.string ?: @"";
     NSString *base = self.lastSyncedToTargetText ?: @"";
-    if (!self.hasLocalEditsPendingSync || text.length == 0 || [text isEqualToString:base]) {
-        if (text.length == 0 || [text isEqualToString:base]) {
+    BOOL hasTextDiff = self.hasLocalEditsPendingSync && text.length > 0 && ![text isEqualToString:base];
+    BOOL hasAttachments = self.pendingAttachmentList.count > 0;
+    if (!hasTextDiff && !hasAttachments) {
+        if ((text.length == 0 || [text isEqualToString:base]) && !hasAttachments) {
             [self.unsyncedDrafts removeObjectForKey:key];
         }
         return;
@@ -3653,6 +3992,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     draft.selection = self.textView.selectedRange;
     draft.baseTargetText = base;
     draft.confirmedChips = [self.confirmedChipSet copy];
+    draft.attachments = [self.pendingAttachmentList copy];
     draft.savedAt = NSProcessInfo.processInfo.systemUptime;
     self.unsyncedDrafts[key] = draft;
 }
@@ -3668,16 +4008,16 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     InputMirrorDraft *draft = self.unsyncedDrafts[key];
     if (!draft) return nil;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    if ((now - draft.savedAt) > kMirrorDraftTTL || draft.text.length == 0) {
+    if ((now - draft.savedAt) > kMirrorDraftTTL || (draft.text.length == 0 && draft.attachments.count == 0)) {
         [self.unsyncedDrafts removeObjectForKey:key];
         return nil;
     }
     NSString *safeTarget = targetText ?: @"";
-    if ([safeTarget isEqualToString:draft.text]) {
+    if ([safeTarget isEqualToString:draft.text] && draft.attachments.count == 0) {
         [self.unsyncedDrafts removeObjectForKey:key];
         return nil;
     }
-    if (safeTarget.length == 0 || [safeTarget isEqualToString:(draft.baseTargetText ?: @"")]) {
+    if (safeTarget.length == 0 || [safeTarget isEqualToString:(draft.baseTargetText ?: @"")] || draft.attachments.count > 0) {
         return draft;
     }
     // User typed brand-new different non-empty content directly in the target app -> respect native input
@@ -3787,17 +4127,196 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     NSColor *headerMuted = (self.style == InputMirrorStyleGlass) ? NSColor.secondaryLabelColor : [self currentMutedColor];
     self.titleLabel.textColor = headerMuted;
     self.countLabel.textColor = headerMuted;
+    self.attachButton.contentTintColor = self.pendingAttachmentList.count > 0 ? [self currentAccentColor] : headerMuted;
     self.closeButton.contentTintColor = headerMuted;
-    self.textView.mirrorPlaceholder = @"开始输入…";
+    if (self.dragHovering) {
+        self.cardSurface.outlineColor = [self currentAccentColor];
+        self.cardSurface.layer.borderWidth = 1.8;
+    }
+    self.textView.mirrorPlaceholder = @"开始输入…（支持 📎 上传 / 拖拽附件 / ⌘V 粘贴截图）";
     self.textView.mirrorPlaceholderColor = (self.style == InputMirrorStyleGlass) ? NSColor.tertiaryLabelColor : [[self currentMutedColor] colorWithAlphaComponent:0.65];
     self.textView.font = [self currentBodyFont];
     self.textView.textColor = [self currentTextColor];
     self.textView.insertionPointColor = [self currentAccentColor];
     self.textView.mirrorCaretColor = [self currentAccentColor];
     self.statusDot.layer.backgroundColor = [self currentAccentColor].CGColor;
+    [self rebuildAttachmentStripUI];
     [self.cardSurface setNeedsDisplay:YES];
     [self.textView setNeedsDisplay:YES];
     [self applySkillMenuStyle];
+}
+
+- (void)setDragHoverState:(BOOL)hovering {
+    if (self.dragHovering == hovering) return;
+    self.dragHovering = hovering;
+    [self applyStyleAppearance];
+}
+
+- (void)updateHeaderSummaryLabelForText:(NSString *)text {
+    NSString *base = InputMirrorSummaryText(text ?: @"");
+    if (self.pendingAttachmentList.count > 0) {
+        self.countLabel.stringValue = [NSString stringWithFormat:@"📎%lu · %@", (unsigned long)self.pendingAttachmentList.count, base];
+    } else {
+        self.countLabel.stringValue = base;
+    }
+    NSColor *headerMuted = (self.style == InputMirrorStyleGlass) ? NSColor.secondaryLabelColor : [self currentMutedColor];
+    self.attachButton.contentTintColor = self.pendingAttachmentList.count > 0 ? [self currentAccentColor] : headerMuted;
+}
+
+- (void)layoutMirrorContentSubviews {
+    if (!self.panel || !self.cardSurface || !self.scrollView) return;
+    NSRect bounds = self.cardSurface.bounds;
+    BOOL hasAtt = (self.pendingAttachmentList.count > 0);
+    CGFloat attH = hasAtt ? kMirrorAttachmentBarHeight : 0.0;
+    self.attachmentScrollView.hidden = !hasAtt;
+    if (hasAtt) {
+        self.attachmentScrollView.frame = NSMakeRect(14.0, NSHeight(bounds) - kMirrorHeaderHeight - attH, MAX(60.0, NSWidth(bounds) - 28.0), attH - 2.0);
+    }
+    CGFloat scrollH = MAX(32.0, NSHeight(bounds) - kMirrorHeaderHeight - attH - kMirrorBottomPadding);
+    self.scrollView.frame = NSMakeRect(14.0, kMirrorBottomPadding, MAX(60.0, NSWidth(bounds) - 28.0), scrollH);
+}
+
+- (void)rebuildAttachmentStripUI {
+    if (!self.attachmentContainer || !self.attachmentScrollView) return;
+    for (NSView *sub in [self.attachmentContainer.subviews copy]) {
+        [sub removeFromSuperview];
+    }
+    NSUInteger count = self.pendingAttachmentList.count;
+    [self layoutMirrorContentSubviews];
+    if (count == 0) return;
+
+    NSColor *textColor = [self currentTextColor];
+    NSColor *mutedColor = (self.style == InputMirrorStyleGlass) ? NSColor.secondaryLabelColor : [self currentMutedColor];
+    NSColor *accentColor = [self currentAccentColor];
+    NSColor *pillFill = [[self currentCodeBgColor] colorWithAlphaComponent:0.88];
+    NSColor *pillBorder = [accentColor colorWithAlphaComponent:0.28];
+
+    __weak InputMirrorController *weakSelf = self;
+    CGFloat x = 0.0;
+    for (NSUInteger i = 0; i < count; i++) {
+        InputMirrorAttachment *att = self.pendingAttachmentList[i];
+        NSFont *measureFont = [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium];
+        CGFloat nameW = ceil([att.displayName sizeWithAttributes:@{NSFontAttributeName: measureFont}].width);
+        CGFloat subW = ceil([att.sizeLabel sizeWithAttributes:@{NSFontAttributeName: [NSFont systemFontOfSize:9.5]}].width);
+        CGFloat pillW = MIN(196.0, MAX(118.0, MAX(nameW, subW) + 68.0));
+
+        InputMirrorAttachmentPillView *pill = [[InputMirrorAttachmentPillView alloc] initWithFrame:NSMakeRect(x, 3.0, pillW, 38.0)];
+        pill.attachment = att;
+        pill.fillColor = pillFill;
+        pill.borderColor = pillBorder;
+        pill.textColor = textColor;
+        pill.mutedColor = mutedColor;
+        pill.toolTip = att.fileURL.path ?: att.displayName;
+        NSUInteger idxCopy = i;
+        pill.onRemove = ^{
+            [weakSelf removeAttachmentAtIndex:idxCopy];
+        };
+        [self.attachmentContainer addSubview:pill];
+        x += pillW + 6.0;
+    }
+
+    NSButton *addMore = [NSButton buttonWithTitle:@"+" target:self action:@selector(openAttachmentPicker:)];
+    addMore.bordered = NO;
+    addMore.wantsLayer = YES;
+    addMore.layer.cornerRadius = 9.0;
+    addMore.layer.backgroundColor = [pillFill colorWithAlphaComponent:0.65].CGColor;
+    addMore.layer.borderWidth = 0.85;
+    addMore.layer.borderColor = [mutedColor colorWithAlphaComponent:0.25].CGColor;
+    addMore.font = [NSFont systemFontOfSize:15.0 weight:NSFontWeightMedium];
+    addMore.contentTintColor = accentColor;
+    addMore.toolTip = @"继续添加图片或文件附件（⌘U）";
+    addMore.frame = NSMakeRect(x, 3.0, 32.0, 38.0);
+    [self.attachmentContainer addSubview:addMore];
+    x += 34.0;
+
+    self.attachmentContainer.frame = NSMakeRect(0, 0, MAX(x, NSWidth(self.attachmentScrollView.bounds)), 44.0);
+}
+
+- (BOOL)appendAttachmentObject:(InputMirrorAttachment *)att {
+    if (!att || !att.fileURL) return NO;
+    if (!att.isTemporaryFile) {
+        NSString *stdPath = att.fileURL.URLByStandardizingPath.path;
+        for (InputMirrorAttachment *existing in self.pendingAttachmentList) {
+            if (!existing.isTemporaryFile && [existing.fileURL.URLByStandardizingPath.path isEqualToString:stdPath]) {
+                return YES;
+            }
+        }
+    }
+    [self.pendingAttachmentList addObject:att];
+    [self updateHeaderSummaryLabelForText:self.textView.string ?: @""];
+    [self rebuildAttachmentStripUI];
+    [self adjustHeightToFitContentAnimated:self.panel.visible && !self.previewMode];
+    [self saveCurrentDraftIfNeeded];
+    return YES;
+}
+
+- (BOOL)addAttachmentFromFileURL:(NSURL *)fileURL {
+    InputMirrorAttachment *att = IMCreateAttachmentFromFileURL(fileURL, NO);
+    return [self appendAttachmentObject:att];
+}
+
+- (BOOL)addAttachmentFromImage:(NSImage *)image suggestedName:(NSString *)suggestedName {
+    InputMirrorAttachment *att = IMCreateAttachmentFromClipboardImage(image, suggestedName);
+    return [self appendAttachmentObject:att];
+}
+
+- (void)removeAttachmentAtIndex:(NSUInteger)index {
+    if (index >= self.pendingAttachmentList.count) return;
+    InputMirrorAttachment *removed = self.pendingAttachmentList[index];
+    if (removed.isTemporaryFile && removed.fileURL.isFileURL) {
+        [NSFileManager.defaultManager removeItemAtURL:removed.fileURL error:NULL];
+    }
+    [self.pendingAttachmentList removeObjectAtIndex:index];
+    [self updateHeaderSummaryLabelForText:self.textView.string ?: @""];
+    [self rebuildAttachmentStripUI];
+    [self adjustHeightToFitContentAnimated:self.panel.visible && !self.previewMode];
+    [self saveCurrentDraftIfNeeded];
+}
+
+- (void)clearAttachmentsUpdatingLayout:(BOOL)updateLayout {
+    [self.pendingAttachmentList removeAllObjects];
+    if (updateLayout) {
+        [self updateHeaderSummaryLabelForText:self.textView.string ?: @""];
+        [self rebuildAttachmentStripUI];
+        [self adjustHeightToFitContentAnimated:self.panel.visible && !self.previewMode];
+        [self saveCurrentDraftIfNeeded];
+    } else {
+        [self updateHeaderSummaryLabelForText:self.textView.string ?: @""];
+        [self rebuildAttachmentStripUI];
+    }
+}
+
+- (void)clearAttachments {
+    [self clearAttachmentsUpdatingLayout:YES];
+}
+
+- (void)openAttachmentPicker:(id)sender {
+    if (self.attachmentPickerOpen) return;
+    self.attachmentPickerOpen = YES;
+    self.suppressResignSync = YES;
+    [NSApp activateIgnoringOtherApps:YES];
+
+    NSOpenPanel *picker = [NSOpenPanel openPanel];
+    picker.canChooseFiles = YES;
+    picker.canChooseDirectories = NO;
+    picker.allowsMultipleSelection = YES;
+    picker.title = @"添加附件到镜像输入";
+    picker.prompt = @"添加附件";
+    picker.message = @"可多选图片、PDF、文档或代码文件，回车发送时将自动同步粘贴至目标应用";
+
+    NSModalResponse resp = [picker runModal];
+    self.attachmentPickerOpen = NO;
+    self.suppressResignSync = NO;
+
+    if (resp == NSModalResponseOK) {
+        for (NSURL *url in picker.URLs) {
+            [self addAttachmentFromFileURL:url];
+        }
+    }
+    if (self.panel.visible && !self.previewMode) {
+        [self.panel makeKeyAndOrderFront:nil];
+        [self.panel makeFirstResponder:self.textView];
+    }
 }
 
 #pragma mark - Minimalist UI Construction
@@ -3824,12 +4343,26 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     self.panel.minSize = NSMakeSize(kMirrorMinWidth, kMirrorMinHeight);
     self.panel.maxSize = NSMakeSize(1200.0, kMirrorMaxHeight);
 
-    PanelSurface *card = [[PanelSurface alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(frame), NSHeight(frame))];
+    InputMirrorDropSurface *card = [[InputMirrorDropSurface alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(frame), NSHeight(frame))];
     card.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     card.wantsLayer = YES;
     card.layer.cornerRadius = 18.0;
     card.layer.borderWidth = 1.0;
     card.layer.masksToBounds = YES;
+    __weak InputMirrorController *weakCardSelf = self;
+    card.onDragHoverChanged = ^(BOOL hovering) {
+        [weakCardSelf setDragHoverState:hovering];
+    };
+    card.onReceiveFileURLs = ^BOOL(NSArray<NSURL *> *urls) {
+        BOOL any = NO;
+        for (NSURL *u in urls) {
+            if ([weakCardSelf addAttachmentFromFileURL:u]) any = YES;
+        }
+        return any;
+    };
+    card.onReceiveImage = ^BOOL(NSImage *image) {
+        return [weakCardSelf addAttachmentFromImage:image suggestedName:nil];
+    };
     self.panel.contentView = card;
     self.cardSurface = card;
 
@@ -3868,7 +4401,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     NSTextField *title = [NSTextField labelWithString:@"镜像输入"];
     title.font = [NSFont systemFontOfSize:12.5 weight:NSFontWeightMedium];
     title.lineBreakMode = NSLineBreakByTruncatingTail;
-    title.frame = NSMakeRect(53, 7, MAX(80.0, NSWidth(frame) - 215.0), 18);
+    title.frame = NSMakeRect(53, 7, MAX(80.0, NSWidth(frame) - 246.0), 18);
     title.autoresizingMask = NSViewWidthSizable;
     [header addSubview:title];
     self.titleLabel = title;
@@ -3881,10 +4414,27 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     count.backgroundColor = NSColor.clearColor;
     count.wantsLayer = YES;
     count.layer.backgroundColor = NSColor.clearColor.CGColor;
-    count.frame = NSMakeRect(NSWidth(frame) - 154, 7, 110, 18);
+    count.frame = NSMakeRect(NSWidth(frame) - 186, 7, 118, 18);
     count.autoresizingMask = NSViewMinXMargin;
     [header addSubview:count];
     self.countLabel = count;
+
+    NSButton *attachBtn = [[NSButton alloc] initWithFrame:NSMakeRect(NSWidth(frame) - 64, 4, 26, 26)];
+    attachBtn.bordered = NO;
+    attachBtn.target = self;
+    attachBtn.action = @selector(openAttachmentPicker:);
+    attachBtn.autoresizingMask = NSViewMinXMargin;
+    attachBtn.toolTip = @"上传图片或文件附件（⌘U · 支持拖拽与 ⌘V 粘贴截图）";
+    NSImage *clipImg = [NSImage imageWithSystemSymbolName:@"paperclip" accessibilityDescription:@"上传附件"];
+    if (clipImg) {
+        NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:13.5 weight:NSFontWeightMedium];
+        attachBtn.image = [clipImg imageWithSymbolConfiguration:cfg] ?: clipImg;
+        attachBtn.imagePosition = NSImageOnly;
+    } else {
+        attachBtn.title = @"📎";
+    }
+    [header addSubview:attachBtn];
+    self.attachButton = attachBtn;
 
     NSButton *closeBtn = [NSButton buttonWithTitle:@"×" target:self action:@selector(handleCloseButton:)];
     closeBtn.bordered = NO;
@@ -3894,6 +4444,20 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     closeBtn.toolTip = @"收起（再次点击输入框恢复）";
     [header addSubview:closeBtn];
     self.closeButton = closeBtn;
+
+    // Horizontal attachment thumbnail strip (shown dynamically when attachments are staged)
+    NSScrollView *attScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(14, NSHeight(frame) - kMirrorHeaderHeight - kMirrorAttachmentBarHeight, NSWidth(frame) - 28, kMirrorAttachmentBarHeight - 2)];
+    attScroll.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    attScroll.hasHorizontalScroller = NO;
+    attScroll.hasVerticalScroller = NO;
+    attScroll.drawsBackground = NO;
+    attScroll.borderType = NSNoBorder;
+    attScroll.hidden = YES;
+    NSView *attContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(attScroll.bounds), 44.0)];
+    attScroll.documentView = attContainer;
+    [card addSubview:attScroll];
+    self.attachmentScrollView = attScroll;
+    self.attachmentContainer = attContainer;
 
     // Clean full-bleed scrollable text canvas (no bottom footer bar, no Send button!)
     NSRect scrollFrame = NSMakeRect(14, kMirrorBottomPadding, NSWidth(frame) - 28, NSHeight(frame) - kMirrorHeaderHeight - kMirrorBottomPadding);
@@ -3953,6 +4517,23 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     tv.onNativeMentionHandoffShortcut = ^{
         [weakSelf handoffToNativeMentionMenu];
     };
+    tv.onOpenAttachmentPickerShortcut = ^{
+        [weakSelf openAttachmentPicker:nil];
+    };
+    tv.onPasteFileURLs = ^BOOL(NSArray<NSURL *> *urls) {
+        BOOL any = NO;
+        for (NSURL *u in urls) {
+            if ([weakSelf addAttachmentFromFileURL:u]) any = YES;
+        }
+        return any;
+    };
+    tv.onPasteImage = ^BOOL(NSImage *image) {
+        return [weakSelf addAttachmentFromImage:image suggestedName:nil];
+    };
+    tv.onDragHoverChanged = ^(BOOL hovering) {
+        [weakSelf setDragHoverState:hovering];
+    };
+    [tv registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
 
     scroll.documentView = tv;
     self.textView = tv;
@@ -3969,9 +4550,13 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     if (!self.panel || !self.textView.layoutManager || !self.textView.textContainer) return;
     [self.textView.layoutManager ensureLayoutForTextContainer:self.textView.textContainer];
     NSRect used = [self.textView.layoutManager usedRectForTextContainer:self.textView.textContainer];
-    CGFloat targetH = InputMirrorTargetHeightForContentHeight(used.size.height);
+    CGFloat extraH = self.pendingAttachmentList.count > 0 ? kMirrorAttachmentBarHeight : 0.0;
+    CGFloat targetH = MIN(kMirrorMaxHeight, InputMirrorTargetHeightForContentHeight(used.size.height) + extraH);
     NSRect current = self.panel.frame;
-    if (fabs(current.size.height - targetH) < 2.0) return;
+    if (fabs(current.size.height - targetH) < 2.0) {
+        [self layoutMirrorContentSubviews];
+        return;
+    }
 
     // Anchor top edge so the input grows naturally downward (clamped safely to visible screen)
     CGFloat topY = NSMaxY(current);
@@ -3983,6 +4568,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     self.suppressFrameSave = YES;
     [self.panel setFrame:nextFrame display:YES animate:animated];
     self.suppressFrameSave = NO;
+    [self layoutMirrorContentSubviews];
     if (self.skillMenuPanel.visible) {
         [self repositionSkillMenuPanel];
     }
@@ -4042,6 +4628,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
 
 - (void)windowDidResize:(NSNotification *)notification {
     [self saveCurrentFrame];
+    [self layoutMirrorContentSubviews];
     if (self.skillMenuPanel.visible) {
         [self repositionSkillMenuPanel];
     }
@@ -4301,7 +4888,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     // actually held synced text before suddenly emptying.
     NSString *trimmed = [safeText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     NSString *syncedSnapshot = self.lastSyncedToTargetText ?: @"";
-    BOOL hasActiveUnsynced = self.hasLocalEditsPendingSync || (draft != nil);
+    BOOL hasActiveUnsynced = self.hasLocalEditsPendingSync || (self.pendingAttachmentList.count > 0) || (draft != nil);
     BOOL likelySent = (syncedSnapshot.length >= 2) || ((now - self.lastExternalReturnTime) < 1.5);
     if (sameTarget && self.panel.visible && !hasActiveUnsynced && syncedSnapshot.length > 0 && trimmed.length == 0 && likelySent) {
         self.mirroredText = @"";
@@ -4328,16 +4915,21 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
         if (draft.confirmedChips.count) {
             [self.confirmedChipSet unionSet:draft.confirmedChips];
         }
+        [self.pendingAttachmentList removeAllObjects];
+        if (draft.attachments.count) {
+            [self.pendingAttachmentList addObjectsFromArray:draft.attachments];
+        }
+        [self rebuildAttachmentStripUI];
         [self updateMirroredText:draft.text
                        selection:draft.selection
                          appName:displayName
                          appIcon:appIcon];
         self.lastSyncedToTargetText = safeText;
-        self.hasLocalEditsPendingSync = YES;
+        self.hasLocalEditsPendingSync = (draft.text.length > 0 && ![draft.text isEqualToString:safeText]);
         return NO;
     }
 
-    if (sameTarget && self.hasLocalEditsPendingSync && [safeText isEqualToString:syncedSnapshot]) {
+    if (sameTarget && (self.hasLocalEditsPendingSync || self.pendingAttachmentList.count > 0) && [safeText isEqualToString:syncedSnapshot]) {
         self.targetAppName = displayName;
         self.titleLabel.stringValue = displayName;
         self.appIconView.image = appIcon;
@@ -4345,6 +4937,10 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
         return NO;
     }
 
+    if (!sameTarget) {
+        [self.pendingAttachmentList removeAllObjects];
+        [self rebuildAttachmentStripUI];
+    }
     if (!sameTarget || safeText.length == 0) {
         [self.confirmedChipSet removeAllObjects];
     }
@@ -4390,6 +4986,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
 
 - (void)pollFocusedInput {
     if (!self.enabled || self.previewMode) return;
+    if (self.attachmentPickerOpen) return;
     if (self.awaitingUserClickAfterJump) return;
     if (self.syncInFlight) return;
     if (self.panel.isKeyWindow) return;
@@ -4596,7 +5193,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
 
     self.titleLabel.stringValue = appName.length ? appName : @"镜像输入";
     self.appIconView.image = appIcon;
-    self.countLabel.stringValue = InputMirrorSummaryText(safeText);
+    [self updateHeaderSummaryLabelForText:safeText];
 
     if (textChanged || selChanged) {
         if (textChanged) {
@@ -4623,7 +5220,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     NSString *current = self.textView.string ?: @"";
     self.mirroredText = current;
     self.mirroredSelection = self.textView.selectedRange;
-    self.countLabel.stringValue = InputMirrorSummaryText(current);
+    [self updateHeaderSummaryLabelForText:current];
     [self updatePlaceholderVisibility];
 
     if (!self.textView.hasMarkedText) {
@@ -5733,6 +6330,90 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
     }
 }
 
+static NSArray<NSDictionary<NSPasteboardType, NSData *> *> *IMSnapshotPasteboard(NSPasteboard *pb) {
+    if (!pb) return @[];
+    NSMutableArray<NSDictionary<NSPasteboardType, NSData *> *> *snap = [NSMutableArray array];
+    for (NSPasteboardItem *item in pb.pasteboardItems) {
+        NSMutableDictionary<NSPasteboardType, NSData *> *dict = [NSMutableDictionary dictionary];
+        for (NSPasteboardType t in item.types) {
+            NSData *d = [item dataForType:t];
+            if (d) dict[t] = d;
+        }
+        if (dict.count) [snap addObject:dict];
+    }
+    return snap;
+}
+
+static void IMRestorePasteboardSnapshot(NSPasteboard *pb, NSArray<NSDictionary<NSPasteboardType, NSData *> *> *snap) {
+    if (!pb) return;
+    [pb clearContents];
+    if (!snap.count) return;
+    NSMutableArray<NSPasteboardItem *> *items = [NSMutableArray arrayWithCapacity:snap.count];
+    for (NSDictionary<NSPasteboardType, NSData *> *dict in snap) {
+        NSPasteboardItem *item = [[NSPasteboardItem alloc] init];
+        for (NSPasteboardType t in dict) {
+            [item setData:dict[t] forType:t];
+        }
+        [items addObject:item];
+    }
+    [pb writeObjects:items];
+}
+
+static BOOL IMWriteAttachmentToPasteboard(NSPasteboard *pb, InputMirrorAttachment *att) {
+    if (!pb || !att || !att.fileURL) return NO;
+    NSString *ext = att.fileURL.pathExtension ?: @"";
+    if (att.isTemporaryFile || IMIsRasterImageExtension(ext)) {
+        NSImage *img = [[NSImage alloc] initWithContentsOfURL:att.fileURL];
+        NSData *png = IMPNGDataFromImage(img);
+        if (png.length > 0) {
+            [pb clearContents];
+            return [pb setData:png forType:NSPasteboardTypePNG];
+        }
+    }
+    [pb clearContents];
+    return [pb writeObjects:@[att.fileURL]];
+}
+
+static void IMReplayAttachmentsAtIndex(pid_t pid,
+                                       NSArray<InputMirrorAttachment *> *attachments,
+                                       NSUInteger index,
+                                       NSArray<NSDictionary<NSPasteboardType, NSData *> *> *savedClipboard,
+                                       void (^completion)(void)) {
+    if (index >= attachments.count) {
+        // Allow Electron/Web chat composer ~240ms to finish reading the pasted attachment asynchronously before Enter & clipboard restore
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.24 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (completion) completion();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.26 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                IMRestorePasteboardSnapshot(NSPasteboard.generalPasteboard, savedClipboard);
+                for (InputMirrorAttachment *att in attachments) {
+                    if (att.isTemporaryFile && att.fileURL.isFileURL) {
+                        [NSFileManager.defaultManager removeItemAtURL:att.fileURL error:NULL];
+                    }
+                }
+            });
+        });
+        return;
+    }
+    InputMirrorAttachment *att = attachments[index];
+    if (IMWriteAttachmentToPasteboard(NSPasteboard.generalPasteboard, att)) {
+        IMSendKeyToPid(pid, kVK_ANSI_V, kCGEventFlagMaskCommand);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.13 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        IMReplayAttachmentsAtIndex(pid, attachments, index + 1, savedClipboard, completion);
+    });
+}
+
+static void IMReplayAttachmentsToPid(pid_t pid,
+                                     NSArray<InputMirrorAttachment *> *attachments,
+                                     void (^completion)(void)) {
+    if (pid <= 0 || attachments.count == 0) {
+        if (completion) completion();
+        return;
+    }
+    NSArray<NSDictionary<NSPasteboardType, NSData *> *> *snap = IMSnapshotPasteboard(NSPasteboard.generalPasteboard);
+    IMReplayAttachmentsAtIndex(pid, attachments, 0, snap, completion);
+}
+
 - (void)handleCloseButton:(id)sender {
     [self dismissTemporarily];
 }
@@ -5741,9 +6422,12 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
     [self.liveSyncTimer invalidate];
     self.liveSyncTimer = nil;
     NSString *text = self.textView.string ?: self.mirroredText ?: @"";
-    BOOL hadPending = self.hasLocalEditsPendingSync || ![text isEqualToString:(self.lastSyncedToTargetText ?: @"")];
-    if (hadPending) {
+    NSArray<InputMirrorAttachment *> *attachmentsToFlush = [self.pendingAttachmentList copy];
+    BOOL hadPending = self.hasLocalEditsPendingSync || attachmentsToFlush.count > 0 || ![text isEqualToString:(self.lastSyncedToTargetText ?: @"")];
+    if (hadPending && (!self.targetElement || self.targetPID <= 0)) {
         [self saveCurrentDraftIfNeeded];
+    } else if (attachmentsToFlush.count > 0) {
+        [self clearAttachmentsUpdatingLayout:NO];
     }
     self.hasLocalEditsPendingSync = NO;
     self.suppressResignSync = YES;
@@ -5756,8 +6440,15 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
     }
     [self hidePanel];
     self.suppressResignSync = NO;
+    if (attachmentsToFlush.count > 0 && self.onSyncAttachmentsBack) {
+        self.onSyncAttachmentsBack(attachmentsToFlush, NO);
+    }
     if (hadPending && !self.syncInFlight && self.targetElement && self.targetPID > 0) {
-        [self flushLocalEditsToTargetAndSend:NO];
+        [self flushLocalEditsToTargetAndSend:NO
+                        forceKeystrokeEvents:NO
+                             triggerLocation:NSNotFound
+                        autoConfirmSelection:NO
+                                 attachments:attachmentsToFlush];
     } else if (self.targetPID > 0 && !self.previewMode) {
         NSRunningApplication *targetApp = [NSRunningApplication runningApplicationWithProcessIdentifier:self.targetPID];
         [targetApp activateWithOptions:NSApplicationActivateIgnoringOtherApps];
@@ -5768,13 +6459,15 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
     [self.liveSyncTimer invalidate];
     self.liveSyncTimer = nil;
     NSString *text = self.textView.string ?: @"";
+    NSArray<InputMirrorAttachment *> *attachmentsToFlush = [self.pendingAttachmentList copy];
     AXUIElementRef element = self.targetElement ? (AXUIElementRef)CFRetain(self.targetElement) : NULL;
     BOOL hasNativeChips = (self.confirmedChipSet.count > 0 &&
                            IMSegmentsContainNativeChip(InputMirrorBuildSyncSegments(text, self.confirmedChipSet)));
-    BOOL needsFlush = hasNativeChips || self.hasLocalEditsPendingSync || ![text isEqualToString:(self.lastSyncedToTargetText ?: @"")];
+    BOOL needsFlush = attachmentsToFlush.count > 0 || hasNativeChips || self.hasLocalEditsPendingSync || ![text isEqualToString:(self.lastSyncedToTargetText ?: @"")];
     pid_t pid = self.targetPID;
 
-    // Clear draft, pending flag & suppress resign sync BEFORE hidePanel so windowDidResignKey NEVER triggers a second sync!
+    // Clear draft, attachments, pending flag & suppress resign sync BEFORE hidePanel so windowDidResignKey NEVER triggers a second sync!
+    [self clearAttachmentsUpdatingLayout:NO];
     [self clearDraftForKey:[self currentDraftKey]];
     self.hasLocalEditsPendingSync = NO;
     self.suppressResignSync = YES;
@@ -5789,6 +6482,9 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
     [self hidePanel];
     self.suppressResignSync = NO;
 
+    if (attachmentsToFlush.count > 0 && self.onSyncAttachmentsBack) {
+        self.onSyncAttachmentsBack(attachmentsToFlush, YES);
+    }
     if (self.onSyncBack) {
         [self.confirmedChipSet removeAllObjects];
         self.onSyncBack(text, YES);
@@ -5806,17 +6502,33 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
         return;
     }
 
-    [self flushLocalEditsToTargetAndSend:YES];
+    [self flushLocalEditsToTargetAndSend:YES
+                    forceKeystrokeEvents:NO
+                         triggerLocation:NSNotFound
+                    autoConfirmSelection:NO
+                             attachments:attachmentsToFlush];
 }
 
 - (void)flushLocalEditsToTargetAndSend:(BOOL)shouldSend {
-    [self flushLocalEditsToTargetAndSend:shouldSend forceKeystrokeEvents:NO triggerLocation:NSNotFound autoConfirmSelection:NO];
+    [self flushLocalEditsToTargetAndSend:shouldSend forceKeystrokeEvents:NO triggerLocation:NSNotFound autoConfirmSelection:NO attachments:@[]];
 }
 
 - (void)flushLocalEditsToTargetAndSend:(BOOL)shouldSend
                   forceKeystrokeEvents:(BOOL)forceKeystrokes
                        triggerLocation:(NSUInteger)triggerLocation
                   autoConfirmSelection:(BOOL)autoConfirmSelection {
+    [self flushLocalEditsToTargetAndSend:shouldSend
+                    forceKeystrokeEvents:forceKeystrokes
+                         triggerLocation:triggerLocation
+                    autoConfirmSelection:autoConfirmSelection
+                             attachments:@[]];
+}
+
+- (void)flushLocalEditsToTargetAndSend:(BOOL)shouldSend
+                  forceKeystrokeEvents:(BOOL)forceKeystrokes
+                       triggerLocation:(NSUInteger)triggerLocation
+                  autoConfirmSelection:(BOOL)autoConfirmSelection
+                           attachments:(NSArray<InputMirrorAttachment *> *)attachments {
     if (self.syncInFlight) return;
     [self.liveSyncTimer invalidate];
     self.liveSyncTimer = nil;
@@ -5850,11 +6562,21 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
         }
 
         if (verified) {
+            AXUIElementSetAttributeValue(element, kAXFocusedAttribute, kCFBooleanTrue);
             CFRelease(element);
             [self clearDraftForKey:draftKey];
             self.lastSyncedToTargetText = shouldSend ? @"" : text;
-            self.postSyncGraceUntil = NSProcessInfo.processInfo.systemUptime + 0.25;
-            if (shouldSend) {
+            self.postSyncGraceUntil = NSProcessInfo.processInfo.systemUptime + (attachments.count > 0 ? 0.65 : 0.25);
+            if (attachments.count > 0) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    IMReplayAttachmentsToPid(pid, attachments, ^{
+                        if (shouldSend) {
+                            IMSendKeyToPid(pid, kVK_Return, 0);
+                        }
+                        self.syncInFlight = NO;
+                    });
+                });
+            } else if (shouldSend) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     IMSendKeyToPid(pid, kVK_Return, 0);
                     self.syncInFlight = NO;
@@ -5866,7 +6588,7 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
         }
     }
 
-    // 2. Fallback & Structured Chip Replayer for Electron/Web inputs (ZERO clipboard usage!):
+    // 2. Fallback & Structured Chip Replayer for Electron/Web inputs + sequential attachment paste:
     AXUIElementSetAttributeValue(element, kAXFocusedAttribute, kCFBooleanTrue);
     CFRelease(element);
 
@@ -5878,15 +6600,17 @@ static void IMReplaySyncSegmentsAtIndex(pid_t pid,
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             void (^finishSend)(void) = ^{
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(settleDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    if (shouldSend) {
-                        IMSendKeyToPid(pid, kVK_Return, 0);
-                        self.lastSyncedToTargetText = @"";
-                    } else {
-                        self.lastSyncedToTargetText = autoConfirmSelection ? @"" : text;
-                    }
-                    [self clearDraftForKey:draftKey];
-                    self.postSyncGraceUntil = NSProcessInfo.processInfo.systemUptime + 0.30;
-                    self.syncInFlight = NO;
+                    IMReplayAttachmentsToPid(pid, attachments, ^{
+                        if (shouldSend) {
+                            IMSendKeyToPid(pid, kVK_Return, 0);
+                            self.lastSyncedToTargetText = @"";
+                        } else {
+                            self.lastSyncedToTargetText = autoConfirmSelection ? @"" : text;
+                        }
+                        [self clearDraftForKey:draftKey];
+                        self.postSyncGraceUntil = NSProcessInfo.processInfo.systemUptime + 0.35;
+                        self.syncInFlight = NO;
+                    });
                 });
             };
             if (text.length == 0) {

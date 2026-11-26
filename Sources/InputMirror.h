@@ -108,6 +108,16 @@ typedef NS_ENUM(NSInteger, InputMirrorItemKind) {
 @property(nonatomic) BOOL consumesTrailingSpace;
 @end
 
+@interface InputMirrorAttachment : NSObject
+@property(nonatomic, copy) NSString *identifier;
+@property(nonatomic, strong) NSURL *fileURL;
+@property(nonatomic, copy) NSString *displayName;
+@property(nonatomic, copy) NSString *sizeLabel;
+@property(nonatomic) BOOL isImage;
+@property(nonatomic) BOOL isTemporaryFile;
+@property(nonatomic, strong, nullable) NSImage *thumbnail;
+@end
+
 FOUNDATION_EXPORT NSArray<InputMirrorSyncSegment *> *InputMirrorBuildSyncSegments(NSString * _Nullable text,
                                                                                   NSSet<NSString *> * _Nullable confirmedChipTokens);
 
@@ -165,6 +175,10 @@ FOUNDATION_EXPORT NSArray<InputMirrorSkillItem *> *InputMirrorFilterSkills(NSArr
 @property(nonatomic, copy, nullable) BOOL (^onAtomicChipBackspace)(void);
 @property(nonatomic, copy, nullable) void (^onNativeSlashHandoffShortcut)(void);
 @property(nonatomic, copy, nullable) void (^onNativeMentionHandoffShortcut)(void);
+@property(nonatomic, copy, nullable) void (^onOpenAttachmentPickerShortcut)(void);
+@property(nonatomic, copy, nullable) BOOL (^onPasteFileURLs)(NSArray<NSURL *> *urls);
+@property(nonatomic, copy, nullable) BOOL (^onPasteImage)(NSImage *image);
+@property(nonatomic, copy, nullable) void (^onDragHoverChanged)(BOOL hovering);
 @end
 
 @interface InputMirrorController : NSObject <NSWindowDelegate, NSTextViewDelegate>
@@ -178,6 +192,7 @@ FOUNDATION_EXPORT NSArray<InputMirrorSkillItem *> *InputMirrorFilterSkills(NSArr
 @property(nonatomic, copy, readonly) NSString *activeSkillMenuCategoryKey;
 @property(nonatomic, copy, readonly) NSArray<NSString *> *availableSkillMenuCategories;
 @property(nonatomic, copy, readonly) NSSet<NSString *> *confirmedChipTokens;
+@property(nonatomic, copy, readonly) NSArray<InputMirrorAttachment *> *pendingAttachments;
 @property(nonatomic, readonly) BOOL lastNativeHandoffAutoConfirmed;
 @property(nonatomic, readonly) BOOL awaitingUserClickAfterJump;
 @property(nonatomic, readonly) BOOL hasUnsyncedEdits;
@@ -193,12 +208,18 @@ FOUNDATION_EXPORT NSArray<InputMirrorSkillItem *> *InputMirrorFilterSkills(NSArr
 @property(nonatomic, copy, nullable) NSString *overrideWorkspaceRootForTesting;
 @property(nonatomic, copy) NSString *defaultsKeyPrefix;
 @property(nonatomic, copy, nullable) void (^onSyncBack)(NSString *text, BOOL shouldSend);
+@property(nonatomic, copy, nullable) void (^onSyncAttachmentsBack)(NSArray<InputMirrorAttachment *> *attachments, BOOL shouldSend);
 @property(nonatomic, copy, nullable) void (^onNativeSlashHandoff)(NSString *text);
 @property(nonatomic, copy, nullable) void (^onNativeMentionHandoff)(NSString *text);
 
 - (instancetype)init;
 - (void)showPreviewSample;
 - (void)resetSavedPosition;
+- (BOOL)addAttachmentFromFileURL:(NSURL *)fileURL;
+- (BOOL)addAttachmentFromImage:(NSImage *)image suggestedName:(NSString * _Nullable)suggestedName;
+- (void)removeAttachmentAtIndex:(NSUInteger)index;
+- (void)clearAttachments;
+- (void)openAttachmentPicker:(id _Nullable)sender;
 - (void)updateMirroredText:(NSString *)text
                  selection:(NSRange)selection
                    appName:(NSString *)appName

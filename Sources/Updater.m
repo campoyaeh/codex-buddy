@@ -3,7 +3,7 @@
 
 static NSString * const kGitHubLatestReleaseAPI = @"https://api.github.com/repos/campoyaeh/codex-buddy/releases/latest";
 static NSString * const kGitHubReleasesPage = @"https://github.com/campoyaeh/codex-buddy/releases/latest";
-static NSString * const kFallbackVersion = @"0.3.14";
+static NSString * const kFallbackVersion = @"0.3.15";
 
 static NSString *StripVersionPrefix(NSString *raw) {
     NSString *trimmed = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];

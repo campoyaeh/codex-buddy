@@ -73,6 +73,7 @@ NSArray<NSDictionary *> *PresetAvatarCatalog(void) {
         @{@"id":@"avatar_aloha",@"name":@"松弛搭子",@"image":@"avatar-aloha.png",@"description":@"花衬衫一穿，从容盯盘不焦虑。"},
         @{@"id":@"avatar_bear",@"name":@"极客搭子",@"image":@"avatar-bear.png",@"description":@"黑框眼镜配小熊，细节逻辑全在线。"},
         @{@"id":@"avatar_polo",@"name":@"清爽搭子",@"image":@"avatar-polo.png",@"description":@"干净利落推进度，件件有着落。"},
+        @{@"id":@"avatar_knitboy",@"name":@"暖绒搭子",@"image":@"avatar-knitboy.png",@"description":@"暖橙针织配微笑，温和稳妥把活干漂亮。"},
         @{@"id":@"avatar_foldcat",@"name":@"折耳喵",@"image":@"avatar-foldcat.png",@"description":@"圆眼乖巧蹲守桌面，安静陪你收工。"}
     ];
 }
@@ -289,6 +290,7 @@ static CGImageRef FloodFillCutoutCreate(CGImageRef cgImage) {
         sumB += pixels[idx + 2];
     }
     int bgR = sumR / 8, bgG = sumG / 8, bgB = sumB / 8;
+    BOOL lightNeutralBg = (MIN(bgR, MIN(bgG, bgB)) >= 182 && (MAX(bgR, MAX(bgG, bgB)) - MIN(bgR, MIN(bgG, bgB))) <= 20);
     const int tolerance = 32;
 
     uint8_t *visited = (uint8_t *)calloc(count, 1);
@@ -301,11 +303,13 @@ static CGImageRef FloodFillCutoutCreate(CGImageRef cgImage) {
     size_t head = 0, tail = 0;
 
     #define IS_BG_PIXEL(idx4) ({ \
-        int _dr = abs((int)pixels[(idx4)] - bgR); \
-        int _dg = abs((int)pixels[(idx4) + 1] - bgG); \
-        int _db = abs((int)pixels[(idx4) + 2] - bgB); \
+        int _pr = (int)pixels[(idx4)], _pg = (int)pixels[(idx4) + 1], _pb = (int)pixels[(idx4) + 2]; \
+        int _dr = abs(_pr - bgR); \
+        int _dg = abs(_pg - bgG); \
+        int _db = abs(_pb - bgB); \
         int _m = MAX(_dr, MAX(_dg, _db)); \
-        (pixels[(idx4) + 3] < 20) || (_m <= tolerance); \
+        BOOL _checkerMatch = lightNeutralBg && (MIN(_pr, MIN(_pg, _pb)) >= 182) && ((MAX(_pr, MAX(_pg, _pb)) - MIN(_pr, MIN(_pg, _pb))) <= 20); \
+        (pixels[(idx4) + 3] < 20) || (_m <= tolerance) || _checkerMatch; \
     })
 
     for (size_t x = 0; x < w; x++) {
@@ -694,13 +698,14 @@ NSImage *MascotImage(NSString *identifier, CGFloat size) {
     [(self.chosen ? accent : PanelColor(0xd3d9e2,0x454545,1)) setStroke];
     card.lineWidth = self.chosen ? 1.6 : 0.6;
     [card stroke];
-    CGFloat artSize = compact ? 48.0 : 76.0;
+    BOOL narrow = self.bounds.size.width < 88.0;
+    CGFloat artSize = compact ? (narrow ? 45.0 : 48.0) : 76.0;
     CGFloat artY = compact ? 25.0 : 38.0;
     DrawMascot(self.mascotID, NSMakeRect((self.bounds.size.width - artSize) / 2.0, artY, artSize, artSize), @"idle");
     NSDictionary *definition = MascotDefinition(self.mascotID);
     NSString *title = definition[@"name"];
     NSDictionary *attributes = @{
-        NSFontAttributeName: [NSFont systemFontOfSize:compact ? 11.5 : 13.0 weight:NSFontWeightSemibold],
+        NSFontAttributeName: [NSFont systemFontOfSize:compact ? (narrow ? 11.0 : 11.5) : 13.0 weight:NSFontWeightSemibold],
         NSForegroundColorAttributeName: self.chosen ? accent : NSColor.labelColor
     };
     NSSize size = [title sizeWithAttributes:attributes];
@@ -724,14 +729,14 @@ NSImage *MascotImage(NSString *identifier, CGFloat size) {
     NSArray<NSDictionary *> *roles = [MascotCatalog() arrayByAddingObjectsFromArray:PresetAvatarCatalog()];
     NSInteger index = 0;
     for (NSDictionary *role in roles) {
-        NSInteger col = index % 4, row = index / 4; index++;
-        NSRect card = NSMakeRect(28 + col * 214, 376 - row * 172, 198, 156);
+        NSInteger col = index % 5, row = index / 5; index++;
+        NSRect card = NSMakeRect(24 + col * 172, 378 - row * 170, 158, 152);
         Round(card.origin.x, card.origin.y, card.size.width, card.size.height, 16, Hex(0x232A34), 0);
-        DrawMascot(role[@"id"], NSMakeRect(NSMidX(card) - 46, card.origin.y + 48, 92, 92), @"idle");
+        DrawMascot(role[@"id"], NSMakeRect(NSMidX(card) - 44, card.origin.y + 46, 88, 88), @"idle");
         NSString *name = role[@"name"];
-        NSDictionary *attributes = @{NSFontAttributeName:[NSFont systemFontOfSize:14 weight:NSFontWeightSemibold],NSForegroundColorAttributeName:Hex(0xF1EADF)};
+        NSDictionary *attributes = @{NSFontAttributeName:[NSFont systemFontOfSize:13.5 weight:NSFontWeightSemibold],NSForegroundColorAttributeName:Hex(0xF1EADF)};
         CGFloat width = [name sizeWithAttributes:attributes].width;
-        [name drawAtPoint:NSMakePoint(NSMidX(card) - width / 2, card.origin.y + 18) withAttributes:attributes];
+        [name drawAtPoint:NSMakePoint(NSMidX(card) - width / 2, card.origin.y + 16) withAttributes:attributes];
     }
 }
 @end
