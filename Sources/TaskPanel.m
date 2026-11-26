@@ -1935,7 +1935,8 @@ int main(int argc, const char *argv[]) {
                 CelebrationController *owner = controller.celebration;
                 [owner buildSettings];
                 NSMutableSet *identifiers = [NSMutableSet set], *artwork = [NSMutableSet set];
-                for (NSDictionary *role in MascotCatalog()) {
+                NSArray<NSDictionary *> *builtInRoles = [MascotCatalog() arrayByAddingObjectsFromArray:PresetAvatarCatalog()];
+                for (NSDictionary *role in builtInRoles) {
                     [identifiers addObject:role[@"id"]];
                     NSCAssert([role[@"name"] length] && [role[@"description"] length], @"Every role must have a name and personality");
                     MascotChoiceButton *choice = nil;
@@ -1952,12 +1953,37 @@ int main(int argc, const char *argv[]) {
                     NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:128 pixelsHigh:128 bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
                     [NSGraphicsContext saveGraphicsState]; NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithBitmapImageRep:bitmap];
                     DrawMascot(role[@"id"],NSMakeRect(0,0,128,128),@"idle"); [NSGraphicsContext restoreGraphicsState];
-                    [artwork addObject:[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}]];
+                    NSData *png = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+                    NSCAssert(png.length > 200, @"Rendered mascot/avatar PNG must be non-empty");
+                    [artwork addObject:png];
                 }
-                NSCAssert(identifiers.count == 6 && artwork.count == 6, @"All six mascots must have distinct identifiers and artwork");
+                NSCAssert(identifiers.count == 12 && artwork.count == 12, @"All 12 built-in mascots and cutout avatars must have distinct identifiers and artwork");
+
+                // Test custom avatar import + automatic solid-background removal + persistence + clear
+                NSString *syntheticSrc = [DataDirectory() stringByAppendingPathComponent:@"synthetic-upload.png"];
+                NSBitmapImageRep *srcRep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:128 pixelsHigh:128 bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+                [NSGraphicsContext saveGraphicsState];
+                NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithBitmapImageRep:srcRep];
+                [NSColor.blackColor setFill];
+                NSRectFill(NSMakeRect(0, 0, 128, 128));
+                [[NSColor colorWithSRGBRed:0.95 green:0.55 blue:0.20 alpha:1.0] setFill];
+                [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(24, 24, 80, 80)] fill];
+                [NSGraphicsContext restoreGraphicsState];
+                [[srcRep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:syntheticSrc atomically:YES];
+
+                NSCAssert([owner importCustomAvatarAtURL:[NSURL fileURLWithPath:syntheticSrc]], @"Custom avatar import must succeed");
+                NSCAssert(MascotHasCustomAvatar() && [owner.settings[@"mascotID"] isEqual:@"custom"], @"Importing custom avatar must activate custom mascotID");
+                CelebrationController *restoredCustom = [[CelebrationController alloc] initWithDirectory:DataDirectory()];
+                NSCAssert([restoredCustom.settings[@"mascotID"] isEqual:@"custom"], @"Custom avatar selection must persist across reload");
+                NSBitmapImageRep *cutRep = [NSBitmapImageRep imageRepWithData:[NSData dataWithContentsOfFile:[DataDirectory() stringByAppendingPathComponent:@"custom-avatar.png"]]];
+                NSCAssert(cutRep && [cutRep colorAtX:0 y:0].alphaComponent < 0.05 && [cutRep colorAtX:cutRep.pixelsWide/2 y:cutRep.pixelsHigh/2].alphaComponent > 0.9,
+                          @"Automatic background removal must strip black exterior corners while preserving centered subject");
+                [owner clearCustomAvatar:nil];
+                NSCAssert(!MascotHasCustomAvatar() && [owner.settings[@"mascotID"] isEqual:@"foreman"], @"Clearing custom avatar must fall back cleanly to foreman");
+
                 controller.collapsed = YES; [controller rebuild];
                 NSCAssert(controller.panel.frame.size.width == 206 && controller.panel.frame.size.height == 40, @"Identity changes must preserve compact capsule geometry");
-                puts("Mascots passed: six distinct designs, exclusive selection, persistence, menu and preview updates, and compact layout");
+                puts("Mascots passed: 12 built-in designs, custom upload with auto background removal, persistence, menu and preview updates, and compact layout");
                 return 0;
             }
             if ([args containsObject:@"--integration-ui-test"]) {

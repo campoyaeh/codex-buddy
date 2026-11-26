@@ -1,5 +1,59 @@
 #import "Mascot.h"
 #import "PanelTheme.h"
+#import <Vision/Vision.h>
+#import <CoreImage/CoreImage.h>
+#import <CoreVideo/CoreVideo.h>
+#include <stdlib.h>
+
+static NSString *gCustomAvatarDirectory = nil;
+static NSString *gCustomAvatarName = nil;
+static NSMutableDictionary<NSString *, NSImage *> *gAvatarImageCache = nil;
+static NSUInteger gCustomAvatarRevision = 1;
+
+static NSMutableDictionary<NSString *, NSImage *> *AvatarCache(void) {
+    if (!gAvatarImageCache) gAvatarImageCache = [NSMutableDictionary dictionary];
+    return gAvatarImageCache;
+}
+
+void MascotSetCustomAvatarDirectory(NSString *directory) {
+    if (directory.length && ![gCustomAvatarDirectory isEqualToString:directory]) {
+        gCustomAvatarDirectory = [directory copy];
+        [AvatarCache() removeObjectForKey:@"custom"];
+        gCustomAvatarRevision++;
+    }
+}
+
+NSString *MascotCustomAvatarDirectory(void) {
+    if (gCustomAvatarDirectory.length) return gCustomAvatarDirectory;
+    NSString *envDir = NSProcessInfo.processInfo.environment[@"TASK_PANEL_DATA_DIR"];
+    if (envDir.length) return envDir;
+    return [NSHomeDirectory() stringByAppendingPathComponent:@".codex/task-manager"];
+}
+
+void MascotSetCustomAvatarName(NSString *name) {
+    NSString *trimmed = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    gCustomAvatarName = trimmed.length ? [trimmed copy] : nil;
+}
+
+NSString *MascotCustomAvatarName(void) {
+    return gCustomAvatarName.length ? gCustomAvatarName : @"我的头像";
+}
+
+static NSString *CustomAvatarProcessedPath(void) {
+    return [MascotCustomAvatarDirectory() stringByAppendingPathComponent:@"custom-avatar.png"];
+}
+
+static NSString *CustomAvatarOriginalPath(void) {
+    return [MascotCustomAvatarDirectory() stringByAppendingPathComponent:@"custom-avatar-original.png"];
+}
+
+BOOL MascotHasCustomAvatar(void) {
+    return [NSFileManager.defaultManager fileExistsAtPath:CustomAvatarProcessedPath()];
+}
+
+BOOL MascotHasCustomAvatarOriginal(void) {
+    return [NSFileManager.defaultManager fileExistsAtPath:CustomAvatarOriginalPath()];
+}
 
 NSArray<NSDictionary *> *MascotCatalog(void) {
     return @[
@@ -12,10 +66,459 @@ NSArray<NSDictionary *> *MascotCatalog(void) {
     ];
 }
 
+NSArray<NSDictionary *> *PresetAvatarCatalog(void) {
+    return @[
+        @{@"id":@"avatar_thumbsup",@"name":@"点赞搭子",@"image":@"avatar-thumbsup.png",@"description":@"竖起大拇指，稳稳接住每一项交付。"},
+        @{@"id":@"avatar_sunny",@"name":@"元气搭子",@"image":@"avatar-sunny.png",@"description":@"笑容满格开跑，复杂任务也轻松拿下。"},
+        @{@"id":@"avatar_aloha",@"name":@"松弛搭子",@"image":@"avatar-aloha.png",@"description":@"花衬衫一穿，从容盯盘不焦虑。"},
+        @{@"id":@"avatar_bear",@"name":@"极客搭子",@"image":@"avatar-bear.png",@"description":@"黑框眼镜配小熊，细节逻辑全在线。"},
+        @{@"id":@"avatar_polo",@"name":@"清爽搭子",@"image":@"avatar-polo.png",@"description":@"干净利落推进度，件件有着落。"},
+        @{@"id":@"avatar_foldcat",@"name":@"折耳喵",@"image":@"avatar-foldcat.png",@"description":@"圆眼乖巧蹲守桌面，安静陪你收工。"}
+    ];
+}
+
+static NSDictionary *CustomAvatarDefinition(void) {
+    return @{
+        @"id": @"custom",
+        @"name": MascotCustomAvatarName(),
+        @"custom": @YES,
+        @"description": @"自定义专属头像，浮窗、菜单栏与完成庆祝同步展示。"
+    };
+}
+
+NSArray<NSDictionary *> *AllMascotCatalog(void) {
+    NSMutableArray<NSDictionary *> *all = [NSMutableArray arrayWithArray:MascotCatalog()];
+    [all addObjectsFromArray:PresetAvatarCatalog()];
+    if (MascotHasCustomAvatar()) [all addObject:CustomAvatarDefinition()];
+    return all;
+}
+
 NSDictionary *MascotDefinition(NSString *identifier) {
-    for (NSDictionary *entry in MascotCatalog()) if ([entry[@"id"] isEqual:identifier]) return entry;
+    if ([identifier isEqual:@"custom"] && MascotHasCustomAvatar()) {
+        return CustomAvatarDefinition();
+    }
+    for (NSDictionary *entry in MascotCatalog()) {
+        if ([entry[@"id"] isEqual:identifier]) return entry;
+    }
+    for (NSDictionary *entry in PresetAvatarCatalog()) {
+        if ([entry[@"id"] isEqual:identifier]) return entry;
+    }
     return MascotCatalog().firstObject;
 }
+
+static NSString *ResolvePresetAvatarPath(NSString *filename) {
+    if (!filename.length) return nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    NSString *resPath = NSBundle.mainBundle.resourcePath;
+    if (resPath.length) {
+        [candidates addObject:[[resPath stringByAppendingPathComponent:@"avatars"] stringByAppendingPathComponent:filename]];
+        [candidates addObject:[resPath stringByAppendingPathComponent:filename]];
+    }
+    NSString *execDir = NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent;
+    if (execDir.length) {
+        [candidates addObject:[[execDir stringByAppendingPathComponent:@"avatars"] stringByAppendingPathComponent:filename]];
+        [candidates addObject:[[[execDir stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"Resources/avatars"] stringByAppendingPathComponent:filename]];
+        [candidates addObject:[[[execDir stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"assets/avatars"] stringByAppendingPathComponent:filename]];
+    }
+    NSString *cwd = fm.currentDirectoryPath;
+    if (cwd.length) {
+        [candidates addObject:[[cwd stringByAppendingPathComponent:@"assets/avatars"] stringByAppendingPathComponent:filename]];
+        [candidates addObject:[[cwd stringByAppendingPathComponent:@"build/avatars"] stringByAppendingPathComponent:filename]];
+    }
+    [candidates addObject:[[NSHomeDirectory() stringByAppendingPathComponent:@".codex/bin/avatars"] stringByAppendingPathComponent:filename]];
+    for (NSString *path in candidates) {
+        if ([fm fileExistsAtPath:path]) return path;
+    }
+    return nil;
+}
+
+static NSImage *ResolvedAvatarBitmapImage(NSDictionary *definition) {
+    NSString *identifier = definition[@"id"];
+    if ([identifier isEqual:@"custom"]) {
+        NSString *cacheKey = [NSString stringWithFormat:@"custom:%lu", (unsigned long)gCustomAvatarRevision];
+        NSImage *cached = AvatarCache()[cacheKey];
+        if (cached) return cached;
+        NSString *path = CustomAvatarProcessedPath();
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data.length) return nil;
+        NSImage *img = [[NSImage alloc] initWithData:data];
+        if (img) AvatarCache()[cacheKey] = img;
+        return img;
+    }
+    NSString *filename = definition[@"image"];
+    if (!filename.length) return nil;
+    NSImage *cached = AvatarCache()[identifier];
+    if (cached) return cached;
+    NSString *path = ResolvePresetAvatarPath(filename);
+    if (!path.length) return nil;
+    NSImage *img = [[NSImage alloc] initWithContentsOfFile:path];
+    if (img) AvatarCache()[identifier] = img;
+    return img;
+}
+
+// ==================== Background Removal & Normalization ====================
+
+static CGImageRef CreateCGImageFromNSImage(NSImage *image) {
+    if (!image) return NULL;
+    NSRect rect = NSMakeRect(0, 0, image.size.width, image.size.height);
+    CGImageRef cg = [image CGImageForProposedRect:&rect context:nil hints:nil];
+    if (cg) return CGImageRetain(cg);
+    return NULL;
+}
+
+static CGImageRef DownscaleCGImageIfNeeded(CGImageRef src, size_t maxDim) {
+    if (!src) return NULL;
+    size_t w = CGImageGetWidth(src), h = CGImageGetHeight(src);
+    if (w <= maxDim && h <= maxDim) return CGImageRetain(src);
+    CGFloat scale = (CGFloat)maxDim / (CGFloat)MAX(w, h);
+    size_t nw = MAX((size_t)1, (size_t)llround(w * scale));
+    size_t nh = MAX((size_t)1, (size_t)llround(h * scale));
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, nw, nh, 8, nw * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return CGImageRetain(src);
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, nw, nh), src);
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    return out ?: CGImageRetain(src);
+}
+
+static BOOL ImageAlreadyHasTransparentCorners(const uint8_t *pixels, size_t w, size_t h) {
+    if (w < 4 || h < 4) return NO;
+    size_t coords[4][2] = {{0, 0}, {w - 1, 0}, {0, h - 1}, {w - 1, h - 1}};
+    int transparentCount = 0;
+    for (int i = 0; i < 4; i++) {
+        size_t idx = (coords[i][1] * w + coords[i][0]) * 4;
+        if (pixels[idx + 3] < 24) transparentCount++;
+    }
+    return transparentCount >= 3;
+}
+
+static BOOL MaskRemovedCornersAndKeptSubject(CGImageRef candidate) {
+    if (!candidate) return NO;
+    size_t w = CGImageGetWidth(candidate), h = CGImageGetHeight(candidate);
+    if (w < 4 || h < 4) return NO;
+    size_t count = w * h;
+    uint8_t *buf = (uint8_t *)calloc(count * 4, 1);
+    if (!buf) return NO;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); return NO; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), candidate);
+    CGContextRelease(ctx);
+    BOOL cornersTransparent = ImageAlreadyHasTransparentCorners(buf, w, h);
+    size_t fg = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (buf[i * 4 + 3] > 128) fg++;
+    }
+    free(buf);
+    return cornersTransparent && (fg * 100 >= count * 2) && (fg * 100 <= count * 96);
+}
+
+static CGImageRef VisionForegroundCutoutCreate(CGImageRef cgImage) {
+    if (!cgImage) return NULL;
+    if (@available(macOS 14.0, *)) {
+        Class reqClass = NSClassFromString(@"VNGenerateForegroundInstanceMaskRequest");
+        if (!reqClass) return NULL;
+        VNGenerateForegroundInstanceMaskRequest *request = [[reqClass alloc] init];
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
+        NSError *error = nil;
+        if (![handler performRequests:@[request] error:&error] || !request.results.count) {
+            return NULL;
+        }
+        VNInstanceMaskObservation *obs = request.results.firstObject;
+        if (!obs.allInstances.count) return NULL;
+        CVPixelBufferRef maskBuffer = [obs generateScaledMaskForImageForInstances:obs.allInstances fromRequestHandler:handler error:&error];
+        if (!maskBuffer) return NULL;
+        CIImage *ciInput = [CIImage imageWithCGImage:cgImage];
+        CIImage *ciMask = [CIImage imageWithCVPixelBuffer:maskBuffer];
+        CIFilter *blend = [CIFilter filterWithName:@"CIBlendWithMask"];
+        [blend setValue:ciInput forKey:kCIInputImageKey];
+        [blend setValue:[CIImage emptyImage] forKey:kCIInputBackgroundImageKey];
+        [blend setValue:ciMask forKey:kCIInputMaskImageKey];
+        CIImage *output = blend.outputImage;
+        CGImageRef result = NULL;
+        if (output) {
+            CIContext *ciCtx = [CIContext contextWithOptions:nil];
+            result = [ciCtx createCGImage:output fromRect:ciInput.extent];
+        }
+        CVPixelBufferRelease(maskBuffer);
+        if (result && MaskRemovedCornersAndKeptSubject(result)) {
+            return result;
+        }
+        if (result) CGImageRelease(result);
+    }
+    return NULL;
+}
+
+static CGImageRef FloodFillCutoutCreate(CGImageRef cgImage) {
+    if (!cgImage) return NULL;
+    size_t w = CGImageGetWidth(cgImage), h = CGImageGetHeight(cgImage);
+    size_t count = w * h;
+    if (w < 4 || h < 4) return CGImageRetain(cgImage);
+    uint8_t *pixels = (uint8_t *)calloc(count * 4, 1);
+    if (!pixels) return CGImageRetain(cgImage);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(pixels, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    if (!ctx) { CGColorSpaceRelease(cs); free(pixels); return CGImageRetain(cgImage); }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
+    CGContextRelease(ctx);
+
+    if (ImageAlreadyHasTransparentCorners(pixels, w, h)) {
+        CGColorSpaceRelease(cs);
+        free(pixels);
+        return CGImageRetain(cgImage);
+    }
+
+    // Estimate background color by averaging the 4 corners
+    size_t sampleCoords[8][2] = {
+        {0, 0}, {w - 1, 0}, {0, h - 1}, {w - 1, h - 1},
+        {MIN((size_t)2, w - 1), MIN((size_t)2, h - 1)},
+        {w > 3 ? w - 3 : 0, MIN((size_t)2, h - 1)},
+        {MIN((size_t)2, w - 1), h > 3 ? h - 3 : 0},
+        {w > 3 ? w - 3 : 0, h > 3 ? h - 3 : 0}
+    };
+    int sumR = 0, sumG = 0, sumB = 0;
+    for (int i = 0; i < 8; i++) {
+        size_t idx = (sampleCoords[i][1] * w + sampleCoords[i][0]) * 4;
+        sumR += pixels[idx];
+        sumG += pixels[idx + 1];
+        sumB += pixels[idx + 2];
+    }
+    int bgR = sumR / 8, bgG = sumG / 8, bgB = sumB / 8;
+    const int tolerance = 32;
+
+    uint8_t *visited = (uint8_t *)calloc(count, 1);
+    uint8_t *bgMask = (uint8_t *)calloc(count, 1);
+    size_t *queue = (size_t *)malloc(count * sizeof(size_t));
+    if (!visited || !bgMask || !queue) {
+        free(visited); free(bgMask); free(queue); free(pixels); CGColorSpaceRelease(cs);
+        return CGImageRetain(cgImage);
+    }
+    size_t head = 0, tail = 0;
+
+    #define IS_BG_PIXEL(idx4) ({ \
+        int _dr = abs((int)pixels[(idx4)] - bgR); \
+        int _dg = abs((int)pixels[(idx4) + 1] - bgG); \
+        int _db = abs((int)pixels[(idx4) + 2] - bgB); \
+        int _m = MAX(_dr, MAX(_dg, _db)); \
+        (pixels[(idx4) + 3] < 20) || (_m <= tolerance); \
+    })
+
+    for (size_t x = 0; x < w; x++) {
+        size_t top = x, bot = (h - 1) * w + x;
+        if (!visited[top] && IS_BG_PIXEL(top * 4)) { visited[top] = 1; queue[tail++] = top; }
+        if (!visited[bot] && IS_BG_PIXEL(bot * 4)) { visited[bot] = 1; queue[tail++] = bot; }
+    }
+    for (size_t y = 0; y < h; y++) {
+        size_t left = y * w, right = y * w + (w - 1);
+        if (!visited[left] && IS_BG_PIXEL(left * 4)) { visited[left] = 1; queue[tail++] = left; }
+        if (!visited[right] && IS_BG_PIXEL(right * 4)) { visited[right] = 1; queue[tail++] = right; }
+    }
+
+    while (head < tail) {
+        size_t cur = queue[head++];
+        bgMask[cur] = 1;
+        size_t cx = cur % w, cy = cur / w;
+        if (cx > 0) { size_t n = cur - 1; if (!visited[n] && IS_BG_PIXEL(n * 4)) { visited[n] = 1; queue[tail++] = n; } }
+        if (cx + 1 < w) { size_t n = cur + 1; if (!visited[n] && IS_BG_PIXEL(n * 4)) { visited[n] = 1; queue[tail++] = n; } }
+        if (cy > 0) { size_t n = cur - w; if (!visited[n] && IS_BG_PIXEL(n * 4)) { visited[n] = 1; queue[tail++] = n; } }
+        if (cy + 1 < h) { size_t n = cur + w; if (!visited[n] && IS_BG_PIXEL(n * 4)) { visited[n] = 1; queue[tail++] = n; } }
+    }
+    #undef IS_BG_PIXEL
+
+    // Guard against over-erasing if almost entire image matched background
+    size_t bgCount = 0;
+    for (size_t i = 0; i < count; i++) if (bgMask[i]) bgCount++;
+    if (bgCount * 100 >= count * 98) {
+        free(visited); free(bgMask); free(queue); free(pixels); CGColorSpaceRelease(cs);
+        return CGImageRetain(cgImage);
+    }
+
+    for (size_t y = 0; y < h; y++) {
+        for (size_t x = 0; x < w; x++) {
+            size_t i = y * w + x;
+            if (bgMask[i]) {
+                pixels[i * 4] = pixels[i * 4 + 1] = pixels[i * 4 + 2] = pixels[i * 4 + 3] = 0;
+                continue;
+            }
+            if (x > 0 && x + 1 < w && y > 0 && y + 1 < h) {
+                int bgNeighbors = bgMask[i - 1] + bgMask[i + 1] + bgMask[i - w] + bgMask[i + w];
+                if (bgNeighbors > 0) {
+                    int dr = abs((int)pixels[i * 4] - bgR);
+                    int dg = abs((int)pixels[i * 4 + 1] - bgG);
+                    int db = abs((int)pixels[i * 4 + 2] - bgB);
+                    int dist = MAX(dr, MAX(dg, db));
+                    if (dist < 64) {
+                        int a = MIN(255, MAX(60, (dist - 16) * 5));
+                        pixels[i * 4]     = (uint8_t)((pixels[i * 4] * a) / 255);
+                        pixels[i * 4 + 1] = (uint8_t)((pixels[i * 4 + 1] * a) / 255);
+                        pixels[i * 4 + 2] = (uint8_t)((pixels[i * 4 + 2] * a) / 255);
+                        pixels[i * 4 + 3] = (uint8_t)a;
+                    }
+                }
+            }
+        }
+    }
+
+    CGContextRef outCtx = CGBitmapContextCreate(pixels, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGImageRef outImg = outCtx ? CGBitmapContextCreateImage(outCtx) : NULL;
+    if (outCtx) CGContextRelease(outCtx);
+    CGColorSpaceRelease(cs);
+    free(visited);
+    free(bgMask);
+    free(queue);
+    free(pixels);
+    return outImg ?: CGImageRetain(cgImage);
+}
+
+static CGImageRef NormalizeAvatarSquareCreate(CGImageRef cgImage, BOOL circularCrop, size_t targetSize) {
+    if (!cgImage) return NULL;
+    size_t w = CGImageGetWidth(cgImage), h = CGImageGetHeight(cgImage);
+    size_t count = w * h;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+
+    if (circularCrop) {
+        CGContextRef sqCtx = CGBitmapContextCreate(NULL, targetSize, targetSize, 8, targetSize * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+        CGColorSpaceRelease(cs);
+        if (!sqCtx) return CGImageRetain(cgImage);
+        CGContextSetInterpolationQuality(sqCtx, kCGInterpolationHigh);
+        CGFloat inset = 10.0;
+        CGRect circle = CGRectMake(inset, inset, targetSize - inset * 2, targetSize - inset * 2);
+        CGContextBeginPath(sqCtx);
+        CGContextAddEllipseInRect(sqCtx, circle);
+        CGContextClip(sqCtx);
+        CGFloat scale = MAX(circle.size.width / (CGFloat)w, circle.size.height / (CGFloat)h);
+        CGFloat dw = w * scale, dh = h * scale;
+        CGFloat dx = CGRectGetMidX(circle) - dw / 2.0;
+        CGFloat dy = CGRectGetMidY(circle) - dh / 2.0;
+        CGContextDrawImage(sqCtx, CGRectMake(dx, dy, dw, dh), cgImage);
+        CGImageRef out = CGBitmapContextCreateImage(sqCtx);
+        CGContextRelease(sqCtx);
+        return out;
+    }
+
+    uint8_t *pixels = (uint8_t *)calloc(count * 4, 1);
+    if (!pixels) { CGColorSpaceRelease(cs); return CGImageRetain(cgImage); }
+    CGContextRef ctx = CGBitmapContextCreate(pixels, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    if (!ctx) { free(pixels); CGColorSpaceRelease(cs); return CGImageRetain(cgImage); }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
+    CGContextRelease(ctx);
+
+    size_t minX = w, minY = h, maxX = 0, maxY = 0;
+    for (size_t y = 0; y < h; y++) {
+        for (size_t x = 0; x < w; x++) {
+            if (pixels[(y * w + x) * 4 + 3] > 16) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+    free(pixels);
+
+    CGImageRef cropped = NULL;
+    if (minX < maxX && minY < maxY) {
+        cropped = CGImageCreateWithImageInRect(cgImage, CGRectMake(minX, minY, maxX - minX + 1, maxY - minY + 1));
+    }
+    if (!cropped) cropped = CGImageRetain(cgImage);
+
+    CGContextRef sqCtx = CGBitmapContextCreate(NULL, targetSize, targetSize, 8, targetSize * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    if (!sqCtx) return cropped;
+    CGContextSetInterpolationQuality(sqCtx, kCGInterpolationHigh);
+    CGFloat pad = 12.0;
+    CGFloat avail = (CGFloat)targetSize - pad * 2.0;
+    size_t cw = CGImageGetWidth(cropped), ch = CGImageGetHeight(cropped);
+    CGFloat scale = MIN(avail / (CGFloat)MAX((size_t)1, cw), avail / (CGFloat)MAX((size_t)1, ch));
+    CGFloat dw = cw * scale, dh = ch * scale;
+    CGFloat dx = ((CGFloat)targetSize - dw) / 2.0;
+    CGFloat dy = ((CGFloat)targetSize - dh) / 2.0;
+    CGContextDrawImage(sqCtx, CGRectMake(dx, dy, dw, dh), cropped);
+    CGImageRelease(cropped);
+    CGImageRef out = CGBitmapContextCreateImage(sqCtx);
+    CGContextRelease(sqCtx);
+    return out;
+}
+
+static BOOL WriteCGImageAsPNG(CGImageRef cgImage, NSString *path, NSError **error) {
+    if (!cgImage || !path.length) return NO;
+    [NSFileManager.defaultManager createDirectoryAtPath:path.stringByDeletingLastPathComponent
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:error];
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:cgImage];
+    NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    if (!png.length) return NO;
+    return [png writeToFile:path options:NSDataWritingAtomic error:error];
+}
+
+static BOOL ProcessCGImageIntoCustomAvatar(CGImageRef sourceCG, BOOL removeBackground, NSError **error) {
+    if (!sourceCG) return NO;
+    CGImageRef stage = NULL;
+    if (removeBackground) {
+        stage = VisionForegroundCutoutCreate(sourceCG);
+        if (!stage) {
+            stage = FloodFillCutoutCreate(sourceCG);
+        }
+    } else {
+        stage = CGImageRetain(sourceCG);
+    }
+    BOOL hasTransparency = MaskRemovedCornersAndKeptSubject(stage);
+    CGImageRef finalCG = NormalizeAvatarSquareCreate(stage, !removeBackground && !hasTransparency, 320);
+    CGImageRelease(stage);
+    if (!finalCG) return NO;
+    BOOL ok = WriteCGImageAsPNG(finalCG, CustomAvatarProcessedPath(), error);
+    CGImageRelease(finalCG);
+    if (ok) {
+        [AvatarCache() removeAllObjects];
+        gCustomAvatarRevision++;
+    }
+    return ok;
+}
+
+BOOL MascotImportCustomAvatarFromURL(NSURL *url, BOOL removeBackground, NSError **error) {
+    if (!url) return NO;
+    NSImage *image = [[NSImage alloc] initWithContentsOfURL:url];
+    CGImageRef rawCG = CreateCGImageFromNSImage(image);
+    if (!rawCG) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"CodexBuddyAvatar" code:1 userInfo:@{NSLocalizedDescriptionKey: @"无法读取所选图片文件"}];
+        }
+        return NO;
+    }
+    CGImageRef normalizedRaw = DownscaleCGImageIfNeeded(rawCG, 1024);
+    CGImageRelease(rawCG);
+    WriteCGImageAsPNG(normalizedRaw, CustomAvatarOriginalPath(), NULL);
+    BOOL ok = ProcessCGImageIntoCustomAvatar(normalizedRaw, removeBackground, error);
+    CGImageRelease(normalizedRaw);
+    return ok;
+}
+
+BOOL MascotReprocessCustomAvatar(BOOL removeBackground, NSError **error) {
+    NSString *origPath = MascotHasCustomAvatarOriginal() ? CustomAvatarOriginalPath() : CustomAvatarProcessedPath();
+    if (![NSFileManager.defaultManager fileExistsAtPath:origPath]) return NO;
+    NSImage *image = [[NSImage alloc] initWithContentsOfFile:origPath];
+    CGImageRef rawCG = CreateCGImageFromNSImage(image);
+    if (!rawCG) return NO;
+    BOOL ok = ProcessCGImageIntoCustomAvatar(rawCG, removeBackground, error);
+    CGImageRelease(rawCG);
+    return ok;
+}
+
+void MascotClearCustomAvatar(void) {
+    [NSFileManager.defaultManager removeItemAtPath:CustomAvatarProcessedPath() error:NULL];
+    [NSFileManager.defaultManager removeItemAtPath:CustomAvatarOriginalPath() error:NULL];
+    [AvatarCache() removeAllObjects];
+    gCustomAvatarRevision++;
+}
+
+// ==================== Drawing & Views ====================
+
 static NSColor *Hex(unsigned value) { return [NSColor colorWithSRGBRed:((value>>16)&255)/255.0 green:((value>>8)&255)/255.0 blue:(value&255)/255.0 alpha:1]; }
 static NSColor *Ink(void) { return Hex(0x27303F); }
 static void Shape(NSBezierPath *path, NSColor *fill, CGFloat stroke) {
@@ -48,6 +551,22 @@ static void Smile(CGFloat x, CGFloat y, CGFloat size, BOOL closed) {
 
 void DrawMascot(NSString *identifier, NSRect rect, NSString *state) {
     NSDictionary *definition = MascotDefinition(identifier);
+    NSImage *bitmapAvatar = ResolvedAvatarBitmapImage(definition);
+    if (bitmapAvatar) {
+        [NSGraphicsContext saveGraphicsState];
+        NSGraphicsContext.currentContext.imageInterpolation = NSImageInterpolationHigh;
+        CGFloat side = MIN(rect.size.width, rect.size.height);
+        NSRect target = NSMakeRect(NSMidX(rect) - side / 2.0, NSMidY(rect) - side / 2.0, side, side);
+        if ([state isEqual:@"completed"] && side >= 40) {
+            NSRect glow = NSInsetRect(target, side * 0.08, side * 0.08);
+            [[Hex(0xFFD166) colorWithAlphaComponent:0.22] setFill];
+            [[NSBezierPath bezierPathWithOvalInRect:glow] fill];
+        }
+        [bitmapAvatar drawInRect:target fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1.0 respectFlipped:YES hints:nil];
+        [NSGraphicsContext restoreGraphicsState];
+        return;
+    }
+
     NSString *role = definition[@"id"];
     BOOL foreman = [role isEqual:@"foreman"], inspector = [role isEqual:@"inspector"], fisher = [role isEqual:@"fisher"];
     BOOL electric = [role isEqual:@"electric"], fortune = [role isEqual:@"fortune"], cosmic = [role isEqual:@"cosmic"];
@@ -133,29 +652,66 @@ NSImage *MascotImage(NSString *identifier, CGFloat size) {
         DrawMascot(identifier,rect,@"idle"); return YES;
     }];
 }
+
 @implementation MascotAvatarView
 - (void)drawRect:(NSRect)dirtyRect { DrawMascot(self.mascotID,self.bounds,self.state); }
 @end
+
 @implementation MascotChoiceButton
 - (BOOL)isFlipped { return NO; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
 - (void)drawRect:(NSRect)dirtyRect {
+    BOOL compact = self.bounds.size.height < 100.0;
+    CGFloat radius = compact ? 11.0 : 14.0;
     NSColor *accent = PanelColor(0x855315,0xe8bc72,1);
-    NSBezierPath *card = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds,1,1) xRadius:14 yRadius:14];
+    NSBezierPath *card = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds,1,1) xRadius:radius yRadius:radius];
     NSColor *fill = self.highlighted ? PanelColor(0xe5e9f0,0x383838,1) : PanelColor(0xffffff,0x242424,1);
     [(self.chosen ? [accent colorWithAlphaComponent:0.11] : fill) setFill]; [card fill];
-    [(self.chosen ? accent : PanelColor(0xd3d9e2,0x454545,1)) setStroke]; card.lineWidth = self.chosen ? 1.6 : 0.6; [card stroke];
-    DrawMascot(self.mascotID,NSMakeRect((self.bounds.size.width-76)/2,38,76,76),@"idle");
+    if (self.uploadPlaceholder && !MascotHasCustomAvatar()) {
+        CGFloat dash[2] = {4.0, 3.0};
+        [card setLineDash:dash count:2 phase:0];
+        [PanelColor(0x94a3b8, 0x525b6b, 1.0) setStroke];
+        card.lineWidth = 1.1;
+        [card stroke];
+        CGFloat circleSize = compact ? 36.0 : 52.0;
+        CGFloat cy = compact ? 29.0 : 48.0;
+        CGFloat cx = (self.bounds.size.width - circleSize) / 2.0;
+        NSBezierPath *badge = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(cx, cy, circleSize, circleSize)];
+        [[accent colorWithAlphaComponent:0.12] setFill];
+        [badge fill];
+        CGFloat midX = NSMidX(self.bounds), midY = cy + circleSize / 2.0;
+        Line(midX - 7, midY, midX + 7, midY, accent, 2.0);
+        Line(midX, midY - 7, midX, midY + 7, accent, 2.0);
+        NSString *title = @"上传头像";
+        NSDictionary *attrs = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:compact ? 11.5 : 13.0 weight:NSFontWeightMedium],
+            NSForegroundColorAttributeName: NSColor.secondaryLabelColor
+        };
+        NSSize sz = [title sizeWithAttributes:attrs];
+        [title drawAtPoint:NSMakePoint((self.bounds.size.width - sz.width) / 2.0, compact ? 7.0 : 17.0) withAttributes:attrs];
+        return;
+    }
+    [(self.chosen ? accent : PanelColor(0xd3d9e2,0x454545,1)) setStroke];
+    card.lineWidth = self.chosen ? 1.6 : 0.6;
+    [card stroke];
+    CGFloat artSize = compact ? 48.0 : 76.0;
+    CGFloat artY = compact ? 25.0 : 38.0;
+    DrawMascot(self.mascotID, NSMakeRect((self.bounds.size.width - artSize) / 2.0, artY, artSize, artSize), @"idle");
     NSDictionary *definition = MascotDefinition(self.mascotID);
     NSString *title = definition[@"name"];
-    NSDictionary *attributes = @{NSFontAttributeName:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],NSForegroundColorAttributeName:self.chosen ? accent : NSColor.labelColor};
+    NSDictionary *attributes = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:compact ? 11.5 : 13.0 weight:NSFontWeightSemibold],
+        NSForegroundColorAttributeName: self.chosen ? accent : NSColor.labelColor
+    };
     NSSize size = [title sizeWithAttributes:attributes];
-    [title drawAtPoint:NSMakePoint((self.bounds.size.width-size.width)/2,17) withAttributes:attributes];
+    [title drawAtPoint:NSMakePoint((self.bounds.size.width - size.width) / 2.0, compact ? 6.5 : 17.0) withAttributes:attributes];
     if (self.chosen) {
-        CGFloat x = self.bounds.size.width-17, y = self.bounds.size.height-17;
-        Oval(x-7,y-7,14,14,accent,0);
+        CGFloat x = self.bounds.size.width - (compact ? 13 : 17), y = self.bounds.size.height - (compact ? 13 : 17);
+        CGFloat r = compact ? 6.0 : 7.0;
+        Oval(x - r, y - r, r * 2, r * 2, accent, 0);
         NSColor *check = PanelColor(0xffffff,0x27303f,1);
-        Line(x-3,y,x-0.5,y-3,check,1.6); Line(x-0.5,y-3,x+4,y+3,check,1.6);
+        Line(x - 2.6, y, x - 0.4, y - 2.4, check, 1.5);
+        Line(x - 0.4, y - 2.4, x + 3.4, y + 2.5, check, 1.5);
     }
 }
 @end
@@ -164,22 +720,18 @@ NSImage *MascotImage(NSString *identifier, CGFloat size) {
 - (void)drawRect:(NSRect)dirtyRect {
     [Hex(0x181C23) setFill]; NSRectFill(self.bounds);
     [@"今天，谁来陪你盯进度？" drawAtPoint:NSMakePoint(32,570) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:26 weight:NSFontWeightSemibold],NSForegroundColorAttributeName:Hex(0xF1EADF)}];
-    [@"工头喵小队  /  六位伙伴，随时换班" drawAtPoint:NSMakePoint(34,542) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:13],NSForegroundColorAttributeName:Hex(0x9DA8B7)}];
+    [@"工头喵小队与精选头像  /  随时换班或上传专属形象" drawAtPoint:NSMakePoint(34,542) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:13],NSForegroundColorAttributeName:Hex(0x9DA8B7)}];
+    NSArray<NSDictionary *> *roles = [MascotCatalog() arrayByAddingObjectsFromArray:PresetAvatarCatalog()];
     NSInteger index = 0;
-    for (NSDictionary *role in MascotCatalog()) {
-        NSInteger col = index%3, row = index/3; index++;
-        NSRect card = NSMakeRect(28+col*284,278-row*250,266,238);
-        Round(card.origin.x,card.origin.y,card.size.width,card.size.height,20,Hex(0x232A34),0);
-        DrawMascot(role[@"id"],NSMakeRect(card.origin.x+61,card.origin.y+69,144,144),@"idle");
+    for (NSDictionary *role in roles) {
+        NSInteger col = index % 4, row = index / 4; index++;
+        NSRect card = NSMakeRect(28 + col * 214, 376 - row * 172, 198, 156);
+        Round(card.origin.x, card.origin.y, card.size.width, card.size.height, 16, Hex(0x232A34), 0);
+        DrawMascot(role[@"id"], NSMakeRect(NSMidX(card) - 46, card.origin.y + 48, 92, 92), @"idle");
         NSString *name = role[@"name"];
-        NSDictionary *attributes = @{NSFontAttributeName:[NSFont systemFontOfSize:18 weight:NSFontWeightSemibold],NSForegroundColorAttributeName:Hex(0xF1EADF)};
+        NSDictionary *attributes = @{NSFontAttributeName:[NSFont systemFontOfSize:14 weight:NSFontWeightSemibold],NSForegroundColorAttributeName:Hex(0xF1EADF)};
         CGFloat width = [name sizeWithAttributes:attributes].width;
-        [name drawAtPoint:NSMakePoint(NSMidX(card)-width/2,card.origin.y+38) withAttributes:attributes];
-        NSArray *captions = @[@"安全帽与小清单",@"眼镜与交付检查表",@"薄荷兜帽与小鱼",@"紫色耳机与闪电",@"红领巾与成就金币",@"透明头盔与宇航服"];
-        NSString *caption = captions[index-1];
-        NSDictionary *small = @{NSFontAttributeName:[NSFont systemFontOfSize:12],NSForegroundColorAttributeName:Hex(0x9DA8B7)};
-        CGFloat captionWidth = [caption sizeWithAttributes:small].width;
-        [caption drawAtPoint:NSMakePoint(NSMidX(card)-captionWidth/2,card.origin.y+17) withAttributes:small];
+        [name drawAtPoint:NSMakePoint(NSMidX(card) - width / 2, card.origin.y + 18) withAttributes:attributes];
     }
 }
 @end

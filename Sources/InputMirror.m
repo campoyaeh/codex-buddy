@@ -5547,7 +5547,7 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     unichar effectiveTrigChar = prefix.length ? [prefix characterAtIndex:0] : self.activeSkillTrigger.triggerChar;
 
     if (item.requiresNativeHandoff) {
-        NSString *nativeToken = (item.itemKind == InputMirrorItemKindConversation)
+        NSString *nativeToken = (item.itemKind == InputMirrorItemKindConversation || [item.sourceLabel isEqualToString:@"对话"])
             ? IMNativeMentionQueryToken(item.name)
             : item.name;
         NSString *core = [NSString stringWithFormat:@"%@%@", prefix, nativeToken.length ? nativeToken : item.name];

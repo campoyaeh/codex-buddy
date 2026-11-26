@@ -596,14 +596,21 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
 @implementation CelebrationController
 - (instancetype)initWithDirectory:(NSString *)directory {
     if ((self = [super init])) {
+        MascotSetCustomAvatarDirectory(directory);
         self.settingsPath = [directory stringByAppendingPathComponent:@"settings.json"];
-        self.settings = [@{@"enabled":@YES, @"duration":@4, @"intensity":@0.8, @"palette":@0, @"allScreens":@NO, @"style":@(CelebrationRandomStyle), @"styleVersion":@3, @"showStatusItem":@YES, @"mascotID":@"foreman", @"theme":@(PanelThemeDark), @"suppressAntigravityPermissionPrompt":@NO, @"inputMirrorEnabled":@NO, @"inputMirrorStyle":@(InputMirrorStyleGlass), @"inputMirrorExcludeIDEs":@NO, @"autoCollapsePanel":@NO, @"doNotDisturb":@NO, @"hideUninstalledSources":@NO, @"disabledProviders":@[]} mutableCopy];
+        self.settings = [@{@"enabled":@YES, @"duration":@4, @"intensity":@0.8, @"palette":@0, @"allScreens":@NO, @"style":@(CelebrationRandomStyle), @"styleVersion":@3, @"showStatusItem":@YES, @"mascotID":@"foreman", @"avatarRemoveBg":@YES, @"customAvatarName":@"我的头像", @"theme":@(PanelThemeDark), @"suppressAntigravityPermissionPrompt":@NO, @"inputMirrorEnabled":@NO, @"inputMirrorStyle":@(InputMirrorStyleGlass), @"inputMirrorExcludeIDEs":@NO, @"autoCollapsePanel":@NO, @"doNotDisturb":@NO, @"hideUninstalledSources":@NO, @"disabledProviders":@[]} mutableCopy];
         NSData *data = [NSData dataWithContentsOfFile:self.settingsPath];
         id saved = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
         if ([saved isKindOfClass:NSDictionary.class]) {
             for (NSString *key in self.settings.allKeys) if ([self.settings[key] isKindOfClass:NSNumber.class] && [saved[key] isKindOfClass:NSNumber.class]) self.settings[key] = saved[key];
             if ([saved[@"disabledProviders"] isKindOfClass:NSArray.class]) self.settings[@"disabledProviders"] = saved[@"disabledProviders"];
+            if ([saved[@"customAvatarName"] isKindOfClass:NSString.class] && [saved[@"customAvatarName"] length]) {
+                self.settings[@"customAvatarName"] = saved[@"customAvatarName"];
+            }
+            MascotSetCustomAvatarName(self.settings[@"customAvatarName"]);
             self.settings[@"mascotID"] = MascotDefinition(saved[@"mascotID"])[@"id"];
+        } else {
+            MascotSetCustomAvatarName(self.settings[@"customAvatarName"]);
         }
         double duration = [self.settings[@"duration"] doubleValue];
         double intensity = [self.settings[@"intensity"] doubleValue];
@@ -709,16 +716,92 @@ static NSPoint FollowPointer(NSPoint center, NSValue *pointer, CGFloat distance)
     self.saveStatus.stringValue = saved ? @"设置已自动保存" : @"保存失败，请重新调整后重试";
     if (self.settingDidChange) self.settingDidChange(key);
 }
-- (void)changeMascot:(MascotChoiceButton *)sender {
-    self.settings[@"mascotID"] = MascotDefinition(sender.mascotID)[@"id"];
+- (void)syncMascotChoicesUI {
+    BOOL hasCustom = MascotHasCustomAvatar();
+    if (self.customAvatarChoiceButton) {
+        self.customAvatarChoiceButton.uploadPlaceholder = !hasCustom;
+        NSDictionary *customDef = hasCustom ? MascotDefinition(@"custom") : @{@"name":@"上传头像", @"description":@"上传本地图片作为自定义头像，支持一键去除纯色或人像背景"};
+        self.customAvatarChoiceButton.toolTip = [NSString stringWithFormat:@"%@\n%@", customDef[@"name"], customDef[@"description"]];
+        self.customAvatarChoiceButton.accessibilityLabel = hasCustom ? [NSString stringWithFormat:@"选择%@", customDef[@"name"]] : @"上传自定义头像";
+    }
+    if (self.avatarClearButton) {
+        self.avatarClearButton.hidden = !hasCustom || (self.settingsTabControl && self.settingsTabControl.selectedSegment != 0);
+        self.avatarClearButton.enabled = hasCustom;
+    }
     for (NSView *view in self.settingsWindow.contentView.subviews) if ([view isKindOfClass:MascotChoiceButton.class]) {
         MascotChoiceButton *choice = (MascotChoiceButton *)view;
-        choice.chosen = [choice.mascotID isEqual:self.settings[@"mascotID"]];
+        choice.chosen = (!choice.uploadPlaceholder && [choice.mascotID isEqual:self.settings[@"mascotID"]]);
         choice.accessibilityValue = choice.chosen ? @"已选择" : @"未选择";
         [choice setNeedsDisplay:YES];
     }
     self.mascotDescription.stringValue = MascotDefinition(self.settings[@"mascotID"])[@"description"];
+}
+- (void)changeMascot:(MascotChoiceButton *)sender {
+    if ([sender.mascotID isEqual:@"custom"] && !MascotHasCustomAvatar()) {
+        [self uploadCustomAvatar:sender];
+        return;
+    }
+    self.settings[@"mascotID"] = MascotDefinition(sender.mascotID)[@"id"];
+    [self syncMascotChoicesUI];
     [self saveChange:@"mascotID"];
+    [self preview:sender];
+}
+- (BOOL)importCustomAvatarAtURL:(NSURL *)url {
+    if (!url) return NO;
+    BOOL removeBg = [self.settings[@"avatarRemoveBg"] boolValue];
+    NSError *error = nil;
+    if (!MascotImportCustomAvatarFromURL(url, removeBg, &error)) {
+        self.saveStatus.stringValue = error.localizedDescription ?: @"头像导入失败，请选择有效的图片文件";
+        return NO;
+    }
+    self.settings[@"customAvatarName"] = @"我的头像";
+    MascotSetCustomAvatarName(self.settings[@"customAvatarName"]);
+    self.settings[@"mascotID"] = @"custom";
+    [self syncMascotChoicesUI];
+    [self saveChange:@"mascotID"];
+    self.saveStatus.stringValue = removeBg ? @"已导入自定义头像并自动去除背景" : @"已导入自定义头像";
+    [self preview:nil];
+    return YES;
+}
+- (void)uploadCustomAvatar:(id)sender {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.title = @"选择自定义头像图片";
+    panel.prompt = @"设为头像";
+    panel.message = [self.settings[@"avatarRemoveBg"] boolValue]
+        ? @"支持 PNG / JPG / WebP / HEIC 等格式，将自动抠除背景"
+        : @"支持 PNG / JPG / WebP / HEIC 等格式";
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    panel.allowedFileTypes = @[@"png", @"jpg", @"jpeg", @"webp", @"heic", @"gif", @"tiff", @"bmp"];
+    #pragma clang diagnostic pop
+    if ([panel runModal] == NSModalResponseOK && panel.URL) {
+        [self importCustomAvatarAtURL:panel.URL];
+    }
+}
+- (void)toggleAvatarRemoveBg:(NSButton *)sender {
+    BOOL removeBg = (sender.state == NSControlStateValueOn);
+    self.settings[@"avatarRemoveBg"] = @(removeBg);
+    if (MascotHasCustomAvatar()) {
+        MascotReprocessCustomAvatar(removeBg, NULL);
+        [self syncMascotChoicesUI];
+        [self saveChange:@"mascotID"];
+        self.saveStatus.stringValue = removeBg ? @"已为自定义头像开启自动去背景" : @"已恢复自定义头像原图裁剪";
+        [self preview:sender];
+    } else {
+        [self saveChange:@"avatarRemoveBg"];
+    }
+}
+- (void)clearCustomAvatar:(id)sender {
+    MascotClearCustomAvatar();
+    if ([self.settings[@"mascotID"] isEqual:@"custom"]) {
+        self.settings[@"mascotID"] = @"foreman";
+    }
+    [self syncMascotChoicesUI];
+    [self saveChange:@"mascotID"];
+    self.saveStatus.stringValue = @"已移除自定义头像";
     [self preview:sender];
 }
 - (void)applyTheme {
@@ -808,6 +891,9 @@ static PanelSurface *SettingsRowDivider(CGFloat x, CGFloat y, CGFloat width) {
     } else {
         [self stopPreview];
     }
+    if (self.avatarClearButton) {
+        self.avatarClearButton.hidden = (index != 0) || !MascotHasCustomAvatar();
+    }
 }
 - (void)buildSettings {
     if (self.settingsWindow) return;
@@ -840,23 +926,49 @@ static PanelSurface *SettingsRowDivider(CGFloat x, CGFloat y, CGFloat width) {
     };
 
     // ==================== TAB 0: 伙伴与外观 ====================
-    addToTab(SettingsCard(NSMakeRect(24, 266, 732, 212)), 0);
-    addToTab(SettingsCard(NSMakeRect(24, 52, 732, 198)), 0);
+    addToTab(SettingsCard(NSMakeRect(24, 250, 732, 234)), 0);
+    addToTab(SettingsCard(NSMakeRect(24, 52, 732, 188)), 0);
 
-    NSTextField *roleHeading = [NSTextField labelWithString:@"工头喵小队"];
+    NSTextField *roleHeading = [NSTextField labelWithString:@"伙伴与自定义头像"];
     roleHeading.font = [NSFont systemFontOfSize:15.5 weight:NSFontWeightSemibold];
-    roleHeading.frame = NSMakeRect(44, 444, 140, 22);
+    roleHeading.frame = NSMakeRect(42, 452, 152, 22);
     addToTab(roleHeading, 0);
 
-    NSTextField *roleSub = [NSTextField labelWithString:@"切换后，任务浮窗头像、菜单栏与庆祝动效同步变身"];
+    NSTextField *roleSub = [NSTextField labelWithString:@"浮窗、菜单栏与庆祝动效同步切换"];
     roleSub.font = [NSFont systemFontOfSize:12];
     roleSub.textColor = NSColor.secondaryLabelColor;
-    roleSub.frame = NSMakeRect(142, 445, 420, 18);
+    roleSub.frame = NSMakeRect(190, 453, 250, 18);
     addToTab(roleSub, 0);
 
+    NSButton *removeBgToggle = [NSButton checkboxWithTitle:@"自动去背景" target:self action:@selector(toggleAvatarRemoveBg:)];
+    removeBgToggle.font = [NSFont systemFontOfSize:12];
+    removeBgToggle.frame = NSMakeRect(482, 452, 92, 22);
+    removeBgToggle.toolTip = @"上传图片时自动识别主体并去除纯色/照片背景";
+    removeBgToggle.state = [self.settings[@"avatarRemoveBg"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+    addToTab(removeBgToggle, 0);
+    self.avatarRemoveBgCheckbox = removeBgToggle;
+
+    NSButton *uploadAvatarBtn = [NSButton buttonWithTitle:@"上传头像…" target:self action:@selector(uploadCustomAvatar:)];
+    uploadAvatarBtn.bezelStyle = NSBezelStyleRounded;
+    uploadAvatarBtn.controlSize = NSControlSizeSmall;
+    uploadAvatarBtn.frame = NSMakeRect(580, 450, 92, 24);
+    uploadAvatarBtn.toolTip = @"从本地选择 PNG / JPG 等图片作为专属头像";
+    addToTab(uploadAvatarBtn, 0);
+    self.avatarUploadButton = uploadAvatarBtn;
+
+    NSButton *clearAvatarBtn = [NSButton buttonWithTitle:@"清除" target:self action:@selector(clearCustomAvatar:)];
+    clearAvatarBtn.bezelStyle = NSBezelStyleRounded;
+    clearAvatarBtn.controlSize = NSControlSizeSmall;
+    clearAvatarBtn.frame = NSMakeRect(676, 450, 62, 24);
+    clearAvatarBtn.toolTip = @"移除当前上传的自定义头像并恢复工头喵";
+    addToTab(clearAvatarBtn, 0);
+    self.avatarClearButton = clearAvatarBtn;
+
+    // Row 1: 6 classic vector mascots (x=42..738, total width=696)
     NSInteger roleIndex = 0;
     for (NSDictionary *role in MascotCatalog()) {
-        MascotChoiceButton *choice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(42+(roleIndex++)*118, 308, 108, 120)];
+        CGFloat x = 42.0 + (roleIndex++) * 117.6;
+        MascotChoiceButton *choice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(round(x), 366, 108, 78)];
         choice.mascotID = role[@"id"];
         choice.chosen = [role[@"id"] isEqual:self.settings[@"mascotID"]];
         choice.target = self; choice.action = @selector(changeMascot:);
@@ -866,23 +978,54 @@ static PanelSurface *SettingsRowDivider(CGFloat x, CGFloat y, CGFloat width) {
         choice.accessibilityValue = choice.chosen ? @"已选择" : @"未选择";
         addToTab(choice, 0);
     }
+
+    // Row 2: 6 cutout preset avatars + 1 custom upload slot (7 cards across x=42..738)
+    NSInteger presetIndex = 0;
+    for (NSDictionary *role in PresetAvatarCatalog()) {
+        CGFloat x = 42.0 + (presetIndex++) * 100.66;
+        MascotChoiceButton *choice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(round(x), 280, 92, 78)];
+        choice.mascotID = role[@"id"];
+        choice.chosen = [role[@"id"] isEqual:self.settings[@"mascotID"]];
+        choice.target = self; choice.action = @selector(changeMascot:);
+        choice.bordered = NO;
+        choice.toolTip = [NSString stringWithFormat:@"%@\n%@",role[@"name"],role[@"description"]];
+        choice.accessibilityLabel = [NSString stringWithFormat:@"选择%@",role[@"name"]];
+        choice.accessibilityValue = choice.chosen ? @"已选择" : @"未选择";
+        addToTab(choice, 0);
+    }
+
+    MascotChoiceButton *customChoice = [[MascotChoiceButton alloc] initWithFrame:NSMakeRect(646, 280, 92, 78)];
+    customChoice.mascotID = @"custom";
+    customChoice.uploadPlaceholder = !MascotHasCustomAvatar();
+    customChoice.chosen = (!customChoice.uploadPlaceholder && [@"custom" isEqual:self.settings[@"mascotID"]]);
+    customChoice.target = self;
+    customChoice.action = @selector(changeMascot:);
+    customChoice.bordered = NO;
+    NSMenu *customMenu = [NSMenu new];
+    [customMenu addItemWithTitle:@"上传新头像…" action:@selector(uploadCustomAvatar:) keyEquivalent:@""].target = self;
+    [customMenu addItemWithTitle:@"移除自定义头像" action:@selector(clearCustomAvatar:) keyEquivalent:@""].target = self;
+    customChoice.menu = customMenu;
+    addToTab(customChoice, 0);
+    self.customAvatarChoiceButton = customChoice;
+
     self.mascotDescription = [NSTextField labelWithString:MascotDefinition(self.settings[@"mascotID"])[@"description"]];
     self.mascotDescription.textColor = NSColor.secondaryLabelColor;
     self.mascotDescription.font = [NSFont systemFontOfSize:12];
-    self.mascotDescription.frame = NSMakeRect(44, 278, 692, 20);
+    self.mascotDescription.frame = NSMakeRect(44, 256, 692, 18);
     addToTab(self.mascotDescription, 0);
+    [self syncMascotChoicesUI];
 
     NSTextField *baseHeading = [NSTextField labelWithString:@"基础与外观"];
     baseHeading.font = [NSFont systemFontOfSize:15.5 weight:NSFontWeightSemibold];
-    baseHeading.frame = NSMakeRect(44, 214, 200, 22);
+    baseHeading.frame = NSMakeRect(44, 206, 200, 22);
     addToTab(baseHeading, 0);
 
     // Row 1: Theme
     NSTextField *themeLabel = [NSTextField labelWithString:@"界面主题"];
     themeLabel.font = [NSFont systemFontOfSize:13];
-    themeLabel.frame = NSMakeRect(44, 174, 140, 22);
+    themeLabel.frame = NSMakeRect(44, 170, 140, 22);
     addToTab(themeLabel, 0);
-    NSPopUpButton *theme = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(564, 172, 172, 26) pullsDown:NO];
+    NSPopUpButton *theme = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(564, 168, 172, 26) pullsDown:NO];
     [theme addItemsWithTitles:PanelThemeTitles()];
     [theme selectItemAtIndex:[self.settings[@"theme"] integerValue]];
     theme.accessibilityLabel = @"界面主题";
@@ -891,7 +1034,7 @@ static PanelSurface *SettingsRowDivider(CGFloat x, CGFloat y, CGFloat width) {
     addToTab(theme, 0);
     self.themeControl = theme;
 
-    addToTab(SettingsRowDivider(44, 158, 692), 0);
+    addToTab(SettingsRowDivider(44, 156, 692), 0);
 
     // Row 2: Status bar & floating task panel
     NSTextField *panelRowLabel = [NSTextField labelWithString:@"菜单栏与任务浮窗"];

@@ -67,8 +67,11 @@ for source_file in providers.py task_bridge.py integrations.py; do
     cp "build/$source_file" "$HOME/.codex/bin/$source_file.new"
     mv "$HOME/.codex/bin/$source_file.new" "$HOME/.codex/bin/$source_file"
 done
-mkdir -p "$HOME/.codex/bin/opencode-plugin"
+mkdir -p "$HOME/.codex/bin/opencode-plugin" "$HOME/.codex/bin/avatars"
 cp build/opencode-plugin/index.js build/opencode-plugin/package.json "$HOME/.codex/bin/opencode-plugin/"
+if [[ -d build/avatars ]]; then
+    cp build/avatars/*.png "$HOME/.codex/bin/avatars/"
+fi
 if [[ -d Sources ]]; then
     cp Sources/Celebration.h Sources/Celebration.m "$HOME/.codex/bin/"
     cp Sources/Mascot.h Sources/Mascot.m "$HOME/.codex/bin/"
