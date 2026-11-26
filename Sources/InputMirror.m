@@ -3,6 +3,7 @@
 #import <Carbon/Carbon.h>
 #import <QuartzCore/QuartzCore.h>
 #import <sqlite3.h>
+#import <sys/stat.h>
 
 static const CGFloat kMirrorDefaultWidth = 600.0;
 static const CGFloat kMirrorMinWidth = 380.0;
@@ -317,6 +318,8 @@ NSString *InputMirrorSummaryText(NSString *text) {
 
 NSAttributedStringKey const InputMirrorListBulletLevelAttributeName = @"InputMirrorListBulletLevel";
 NSAttributedStringKey const InputMirrorListBulletColorAttributeName = @"InputMirrorListBulletColor";
+NSAttributedStringKey const InputMirrorChipColorAttributeName = @"InputMirrorChipColor";
+NSAttributedStringKey const InputMirrorChipFillColorAttributeName = @"InputMirrorChipFillColor";
 
 static NSRegularExpression *IMRegex(NSString *pattern) {
     static NSMutableDictionary<NSString *, NSRegularExpression *> *cache = nil;
@@ -450,6 +453,8 @@ NSAttributedString *InputMirrorFormatAttributedText(NSString *text,
     NSRegularExpression *codeRe = IMRegex(@"`[^`\\n]+`");
     NSRegularExpression *boldRe = IMRegex(@"\\*\\*[^*\\n]+\\*\\*");
     NSRegularExpression *mentionRe = IMRegex(@"(?:^|(?<=[\\s(\\[{<,:;，。：、（）【\\p{Han}]))@[A-Za-z0-9_./\\-\\p{Han}]+");
+    NSRegularExpression *skillTokenRe = IMRegex(@"(?:^|(?<=[\\s(\\[{]))\\$[A-Za-z_\\p{Han}][A-Za-z0-9_.\\-\\p{Han}]*");
+    NSRegularExpression *slashCmdRe = IMRegex(@"(?:^|(?<=\\s))/[A-Za-z][A-Za-z0-9_.\\-]*(?=\\s|$)");
 
     NSUInteger pos = 0;
     NSUInteger len = safeText.length;
@@ -603,10 +608,32 @@ NSAttributedString *InputMirrorFormatAttributedText(NSString *text,
             [attr addAttribute:NSForegroundColorAttributeName value:mutedColor range:NSMakeRange(contentRange.location + hashR.location, hashR.length)];
         }
 
+        NSColor *chipBorder = [accentColor colorWithAlphaComponent:0.38];
+        NSColor *chipFill = [accentColor colorWithAlphaComponent:0.13];
         for (NSTextCheckingResult *mm in [mentionRe matchesInString:line options:0 range:localAll]) {
             NSRange absR = NSMakeRange(contentRange.location + mm.range.location, mm.range.length);
             [attr addAttribute:NSForegroundColorAttributeName value:accentColor range:absR];
-            [attr addAttribute:NSFontAttributeName value:mediumFont range:absR];
+            [attr addAttribute:NSFontAttributeName value:semiboldFont range:absR];
+            if (mm.range.length >= 2) {
+                [attr addAttribute:InputMirrorChipColorAttributeName value:chipBorder range:absR];
+                [attr addAttribute:InputMirrorChipFillColorAttributeName value:chipFill range:absR];
+            }
+        }
+
+        for (NSTextCheckingResult *sm in [skillTokenRe matchesInString:line options:0 range:localAll]) {
+            NSRange absR = NSMakeRange(contentRange.location + sm.range.location, sm.range.length);
+            [attr addAttribute:NSForegroundColorAttributeName value:accentColor range:absR];
+            [attr addAttribute:NSFontAttributeName value:semiboldFont range:absR];
+            [attr addAttribute:InputMirrorChipColorAttributeName value:chipBorder range:absR];
+            [attr addAttribute:InputMirrorChipFillColorAttributeName value:chipFill range:absR];
+        }
+
+        for (NSTextCheckingResult *slm in [slashCmdRe matchesInString:line options:0 range:localAll]) {
+            NSRange absR = NSMakeRange(contentRange.location + slm.range.location, slm.range.length);
+            [attr addAttribute:NSForegroundColorAttributeName value:accentColor range:absR];
+            [attr addAttribute:NSFontAttributeName value:semiboldFont range:absR];
+            [attr addAttribute:InputMirrorChipColorAttributeName value:chipBorder range:absR];
+            [attr addAttribute:InputMirrorChipFillColorAttributeName value:chipFill range:absR];
         }
 
         for (NSTextCheckingResult *cm in [codeRe matchesInString:line options:0 range:localAll]) {
@@ -849,6 +876,52 @@ static void IMAxCollectStructuredText(AXUIElementRef element, NSUInteger depth, 
     }
 }
 
+static void IMAxCollectInlineChipLabels(AXUIElementRef element, NSUInteger depth, NSUInteger *budget, NSMutableArray<NSString *> *labels) {
+    if (!element || depth > 10 || !budget || *budget == 0) return;
+    (*budget)--;
+    id roleObj = IMAxCopyAttribute(element, kAXRoleAttribute);
+    NSString *role = [roleObj isKindOfClass:NSString.class] ? roleObj : @"";
+    if ([role isEqualToString:@"AXButton"] || [role isEqualToString:@"AXLink"]) {
+        id titleObj = IMAxCopyAttribute(element, kAXTitleAttribute) ?: IMAxCopyAttribute(element, kAXDescriptionAttribute) ?: IMAxCopyAttribute(element, kAXValueAttribute);
+        if ([titleObj isKindOfClass:NSString.class]) {
+            NSString *label = IMTrimWhitespaceAndNBSP((NSString *)titleObj);
+            if (label.length > 0) {
+                if (![label hasPrefix:@"@"] && ![label hasPrefix:@"$"] && ![label hasPrefix:@"/"]) {
+                    label = [@"@" stringByAppendingString:label];
+                }
+                [labels addObject:label];
+                return;
+            }
+        }
+    }
+    NSArray *children = IMAxCopyAttribute(element, kAXChildrenAttribute);
+    if (![children isKindOfClass:NSArray.class]) return;
+    for (id child in children) {
+        if (*budget == 0) break;
+        IMAxCollectInlineChipLabels((__bridge AXUIElementRef)child, depth + 1, budget, labels);
+    }
+}
+
+static NSString *IMReplaceObjectReplacementWithChipLabels(NSString *raw, AXUIElementRef element) {
+    if (!raw.length || [raw rangeOfString:@"\uFFFC"].location == NSNotFound) return raw;
+    NSMutableArray<NSString *> *labels = [NSMutableArray array];
+    NSUInteger budget = 240;
+    IMAxCollectInlineChipLabels(element, 0, &budget, labels);
+    NSMutableString *rebuilt = [NSMutableString stringWithCapacity:raw.length + 32];
+    NSUInteger labelIdx = 0;
+    for (NSUInteger i = 0; i < raw.length; i++) {
+        unichar c = [raw characterAtIndex:i];
+        if (c == 0xFFFC) {
+            if (labelIdx < labels.count) {
+                [rebuilt appendString:labels[labelIdx++]];
+            }
+        } else {
+            [rebuilt appendFormat:@"%C", c];
+        }
+    }
+    return rebuilt;
+}
+
 static NSString *IMAxReadTextValue(AXUIElementRef element, BOOL *outUsedStructuredList) {
     if (outUsedStructuredList) *outUsedStructuredList = NO;
     if (!element) return @"";
@@ -877,7 +950,7 @@ static NSString *IMAxReadTextValue(AXUIElementRef element, BOOL *outUsedStructur
             if (InputMirrorIsPlaceholderText(joined, placeholder, desc, title, sel)) return @"";
             if (joined.length > 0) {
                 if (outUsedStructuredList) *outUsedStructuredList = YES;
-                return joined;
+                return IMReplaceObjectReplacementWithChipLabels(joined, element);
             }
         }
     }
@@ -886,7 +959,12 @@ static NSString *IMAxReadTextValue(AXUIElementRef element, BOOL *outUsedStructur
     if ([value isKindOfClass:NSString.class]) {
         NSString *str = (NSString *)value;
         if (InputMirrorIsPlaceholderText(str, placeholder, desc, title, sel)) return @"";
-        if (str.length > 0) return str;
+        if (str.length > 0) {
+            if ([str rangeOfString:@"\uFFFC"].location != NSNotFound && outUsedStructuredList) {
+                *outUsedStructuredList = YES;
+            }
+            return IMReplaceObjectReplacementWithChipLabels(str, element);
+        }
     }
     if ([charCountObj isKindOfClass:NSNumber.class]) {
         NSInteger count = [charCountObj integerValue];
@@ -903,7 +981,10 @@ static NSString *IMAxReadTextValue(AXUIElementRef element, BOOL *outUsedStructur
                     if ([bridged isKindOfClass:NSString.class]) {
                         NSString *s = (NSString *)bridged;
                         if (InputMirrorIsPlaceholderText(s, placeholder, desc, title, sel)) return @"";
-                        return s;
+                        if ([s rangeOfString:@"\uFFFC"].location != NSNotFound && outUsedStructuredList) {
+                            *outUsedStructuredList = YES;
+                        }
+                        return IMReplaceObjectReplacementWithChipLabels(s, element);
                     }
                 }
             }
@@ -912,7 +993,7 @@ static NSString *IMAxReadTextValue(AXUIElementRef element, BOOL *outUsedStructur
     if ([value isKindOfClass:NSString.class]) {
         NSString *str = (NSString *)value;
         if (InputMirrorIsPlaceholderText(str, placeholder, desc, title, sel)) return @"";
-        return str;
+        return IMReplaceObjectReplacementWithChipLabels(str, element);
     }
     return @"";
 }
@@ -1003,10 +1084,103 @@ static void IMSendUnicodeTextToPidEx(pid_t pid, NSString *text, BOOL sendTrigger
 #pragma mark - Skill Discovery, Trigger Parsing & Filtering
 
 @implementation InputMirrorSkillItem
+- (instancetype)init {
+    if ((self = [super init])) {
+        _name = @"";
+        _displayTitle = @"";
+        _displayDetail = @"";
+        _summary = @"";
+        _insertPrefix = @"/";
+        _sourceLabel = @"";
+        _categoryKey = @"skills";
+        _searchKeywords = @"";
+        _symbolName = @"sparkles";
+    }
+    return self;
+}
+@end
+
+@implementation InputMirrorSyncSegment
+- (instancetype)init {
+    if ((self = [super init])) {
+        _text = @"";
+    }
+    return self;
+}
 @end
 
 static BOOL IMIsTriggerBoundaryChar(unichar c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x00A0 || c == 0x3000;
+}
+
+static BOOL IMIsNativeChipPrefixBoundary(unichar c) {
+    return IMIsTriggerBoundaryChar(c) || c == '(' || c == '[' || c == '{';
+}
+
+static BOOL IMIsChipTokenTerminator(unichar c) {
+    return IMIsTriggerBoundaryChar(c) || c == ')' || c == ']' || c == '}' || c == ',' || c == ';' ||
+           c == 0x3001 || c == 0x3002 || c == 0xFF0C || c == 0xFF1B || c == 0xFF09 || c == 0x3011;
+}
+
+NSArray<InputMirrorSyncSegment *> *InputMirrorBuildSyncSegments(NSString *text,
+                                                                NSSet<NSString *> *confirmedChipTokens) {
+    NSString *safeText = text ?: @"";
+    if (!safeText.length) return @[];
+    if (!confirmedChipTokens.count) {
+        InputMirrorSyncSegment *plain = [[InputMirrorSyncSegment alloc] init];
+        plain.isNativeChip = NO;
+        plain.text = safeText;
+        return @[plain];
+    }
+
+    NSMutableArray<InputMirrorSyncSegment *> *segments = [NSMutableArray array];
+    NSUInteger len = safeText.length;
+    NSUInteger plainStart = 0;
+    NSUInteger i = 0;
+
+    while (i < len) {
+        unichar ch = [safeText characterAtIndex:i];
+        BOOL canTrigger = (ch == '@' || ch == '$' || ch == '/') &&
+                          (i == 0 || IMIsNativeChipPrefixBoundary([safeText characterAtIndex:i - 1]));
+        if (canTrigger) {
+            NSUInteger end = i + 1;
+            while (end < len && !IMIsChipTokenTerminator([safeText characterAtIndex:end])) {
+                end++;
+            }
+            if (end > i + 1) {
+                NSString *candidate = [safeText substringWithRange:NSMakeRange(i, end - i)];
+                if ([confirmedChipTokens containsObject:candidate]) {
+                    if (i > plainStart) {
+                        InputMirrorSyncSegment *plain = [[InputMirrorSyncSegment alloc] init];
+                        plain.isNativeChip = NO;
+                        plain.text = [safeText substringWithRange:NSMakeRange(plainStart, i - plainStart)];
+                        [segments addObject:plain];
+                    }
+                    InputMirrorSyncSegment *chip = [[InputMirrorSyncSegment alloc] init];
+                    chip.isNativeChip = YES;
+                    chip.triggerChar = ch;
+                    chip.text = [candidate substringFromIndex:1];
+                    if (end < len && [safeText characterAtIndex:end] == ' ') {
+                        chip.consumesTrailingSpace = YES;
+                        end += 1;
+                    }
+                    [segments addObject:chip];
+                    i = end;
+                    plainStart = end;
+                    continue;
+                }
+            }
+        }
+        i++;
+    }
+
+    if (plainStart < len) {
+        InputMirrorSyncSegment *tail = [[InputMirrorSyncSegment alloc] init];
+        tail.isNativeChip = NO;
+        tail.text = [safeText substringFromIndex:plainStart];
+        [segments addObject:tail];
+    }
+    return segments;
 }
 
 static BOOL IMIsAtTriggerBoundaryChar(unichar c) {
@@ -1084,9 +1258,52 @@ static NSString *IMStripYAMLQuotes(NSString *raw) {
     return [trimmed stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
-static void IMParseSkillMarkdownFile(NSString *mdPath, NSString *fallbackName, NSString **outName, NSString **outSummary) {
+static BOOL IMStringContainsCJK(NSString *str) {
+    for (NSUInteger i = 0; i < str.length; i++) {
+        unichar c = [str characterAtIndex:i];
+        if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF)) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void IMParseOpenAIYamlMetadata(NSString *skillDirPath,
+                                      NSString **outDisplayName,
+                                      NSString **outShortDescription) {
+    NSString *displayName = @"";
+    NSString *shortDesc = @"";
+    if (skillDirPath.length > 0) {
+        NSString *yamlPath = [[skillDirPath stringByAppendingPathComponent:@"agents"] stringByAppendingPathComponent:@"openai.yaml"];
+        NSData *data = [NSData dataWithContentsOfFile:yamlPath];
+        if (data.length > 0) {
+            NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            for (NSString *line in [content componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+                NSString *trimmed = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                NSString *lower = trimmed.lowercaseString;
+                if ([lower hasPrefix:@"display_name:"]) {
+                    NSString *val = IMStripYAMLQuotes([trimmed substringFromIndex:13]);
+                    if (val.length > 0) displayName = val;
+                } else if ([lower hasPrefix:@"short_description:"]) {
+                    NSString *val = IMStripYAMLQuotes([trimmed substringFromIndex:18]);
+                    if (val.length > 0) shortDesc = val;
+                }
+            }
+        }
+    }
+    if (outDisplayName) *outDisplayName = displayName;
+    if (outShortDescription) *outShortDescription = shortDesc;
+}
+
+static void IMParseSkillMarkdownFileEx(NSString *mdPath,
+                                       NSString *fallbackName,
+                                       NSString **outName,
+                                       NSString **outDisplayName,
+                                       NSString **outSummary) {
     NSString *resolvedName = fallbackName ?: @"";
+    NSString *resolvedDisplayName = @"";
     NSString *resolvedSummary = @"";
+    NSString *firstH1 = @"";
 
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:mdPath];
     NSData *data = nil;
@@ -1102,6 +1319,7 @@ static void IMParseSkillMarkdownFile(NSString *mdPath, NSString *fallbackName, N
         if (content.length > 0) {
             NSArray<NSString *> *lines = [content componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
             BOOL inFrontmatter = NO;
+            BOOL finishedFrontmatter = NO;
             BOOL collectingDesc = NO;
             NSMutableArray<NSString *> *descParts = [NSMutableArray array];
             for (NSUInteger i = 0; i < lines.count; i++) {
@@ -1113,7 +1331,10 @@ static void IMParseSkillMarkdownFile(NSString *mdPath, NSString *fallbackName, N
                 }
                 if (inFrontmatter) {
                     if ([trimmed isEqualToString:@"---"]) {
-                        break;
+                        inFrontmatter = NO;
+                        finishedFrontmatter = YES;
+                        collectingDesc = NO;
+                        continue;
                     }
                     if (collectingDesc) {
                         BOOL isIndented = (line.length > 0 && ([line characterAtIndex:0] == ' ' || [line characterAtIndex:0] == '\t'));
@@ -1128,6 +1349,12 @@ static void IMParseSkillMarkdownFile(NSString *mdPath, NSString *fallbackName, N
                     if ([lower hasPrefix:@"name:"]) {
                         NSString *val = IMStripYAMLQuotes([trimmed substringFromIndex:5]);
                         if (val.length > 0) resolvedName = val;
+                    } else if ([lower hasPrefix:@"display_name:"]) {
+                        NSString *val = IMStripYAMLQuotes([trimmed substringFromIndex:13]);
+                        if (val.length > 0) resolvedDisplayName = val;
+                    } else if ([lower hasPrefix:@"title:"]) {
+                        NSString *val = IMStripYAMLQuotes([trimmed substringFromIndex:6]);
+                        if (val.length > 0) resolvedDisplayName = val;
                     } else if ([lower hasPrefix:@"description:"]) {
                         NSString *rawVal = [[trimmed substringFromIndex:12] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
                         if ([rawVal isEqualToString:@">"] || [rawVal isEqualToString:@"|"] ||
@@ -1140,10 +1367,16 @@ static void IMParseSkillMarkdownFile(NSString *mdPath, NSString *fallbackName, N
                         }
                     }
                 } else {
+                    if (!firstH1.length && [trimmed hasPrefix:@"# "] && trimmed.length > 2) {
+                        firstH1 = [[trimmed substringFromIndex:2] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                        if (!finishedFrontmatter && resolvedSummary.length > 0) break;
+                        if (finishedFrontmatter) break;
+                        continue;
+                    }
                     // Fallback: grab first non-heading prose line if no YAML frontmatter
-                    if (trimmed.length > 0 && ![trimmed hasPrefix:@"#"] && ![trimmed hasPrefix:@"---"]) {
+                    if (!finishedFrontmatter && !resolvedSummary.length && trimmed.length > 0 && ![trimmed hasPrefix:@"#"] && ![trimmed hasPrefix:@"---"]) {
                         resolvedSummary = trimmed;
-                        break;
+                        if (firstH1.length > 0) break;
                     }
                 }
             }
@@ -1153,19 +1386,61 @@ static void IMParseSkillMarkdownFile(NSString *mdPath, NSString *fallbackName, N
         }
     }
 
+    if (!resolvedDisplayName.length && firstH1.length > 0 && firstH1.length <= 36 && IMStringContainsCJK(firstH1)) {
+        resolvedDisplayName = firstH1;
+    }
+    if (!resolvedDisplayName.length && resolvedSummary.length > 0) {
+        NSRange colonRange = [resolvedSummary rangeOfString:@"："];
+        if (colonRange.location != NSNotFound && colonRange.location >= 2 && colonRange.location <= 22) {
+            NSString *prefix = [resolvedSummary substringToIndex:colonRange.location];
+            if (IMStringContainsCJK(prefix) && ![prefix containsString:@" "]) {
+                resolvedDisplayName = prefix;
+            }
+        }
+    }
+
     if (resolvedSummary.length > 140) {
         resolvedSummary = [[resolvedSummary substringToIndex:139] stringByAppendingString:@"…"];
     }
     if (outName) *outName = resolvedName;
+    if (outDisplayName) *outDisplayName = resolvedDisplayName;
     if (outSummary) *outSummary = resolvedSummary;
 }
 
-static void IMScanSkillDirectory(NSString *dirPath,
-                                 NSString *sourceLabel,
-                                 NSString *insertPrefix,
-                                 NSInteger maxSubdirDepth,
-                                 NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen,
-                                 NSMutableArray<InputMirrorSkillItem *> *outItems) {
+static void IMConfigureSkillOrWorkflowItem(InputMirrorSkillItem *item,
+                                           NSString *name,
+                                           NSString *humanTitle,
+                                           NSString *shortSummary,
+                                           NSString *fullSummary,
+                                           NSString *insertPrefix,
+                                           NSString *sourceLabel,
+                                           NSString *filePath,
+                                           BOOL isWorkflow) {
+    NSString *safeName = name ?: @"";
+    NSString *pref = insertPrefix ?: @"/";
+    NSString *tokenLabel = [NSString stringWithFormat:@"%@%@", pref, safeName];
+    BOOL hasDistinctHumanTitle = (humanTitle.length > 0 && ![humanTitle.lowercaseString isEqualToString:safeName.lowercaseString]);
+
+    item.name = safeName;
+    item.displayTitle = hasDistinctHumanTitle ? humanTitle : tokenLabel;
+    item.displayDetail = hasDistinctHumanTitle ? tokenLabel : @"";
+    item.summary = shortSummary.length ? shortSummary : (fullSummary ?: @"");
+    item.searchKeywords = [NSString stringWithFormat:@"%@ %@ %@", humanTitle ?: @"", fullSummary ?: @"", shortSummary ?: @""];
+    item.insertPrefix = pref;
+    item.sourceLabel = sourceLabel ?: (isWorkflow ? @"工作流" : @"技能");
+    item.categoryKey = @"skills";
+    item.symbolName = isWorkflow ? @"arrow.triangle.branch" : @"sparkles";
+    item.filePath = filePath;
+    item.itemKind = isWorkflow ? InputMirrorItemKindWorkflow : InputMirrorItemKindSkill;
+}
+
+static void IMScanSkillDirectoryEx(NSString *dirPath,
+                                   NSString *sourceLabel,
+                                   NSString *insertPrefix,
+                                   NSInteger maxSubdirDepth,
+                                   BOOL treatLooseMarkdownAsWorkflow,
+                                   NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen,
+                                   NSMutableArray<InputMirrorSkillItem *> *outItems) {
     NSFileManager *fm = NSFileManager.defaultManager;
     BOOL isDir = NO;
     if (!dirPath.length || ![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) return;
@@ -1185,39 +1460,48 @@ static void IMScanSkillDirectory(NSString *dirPath,
             NSString *skillMd = [resolvedPath stringByAppendingPathComponent:@"SKILL.md"];
             if ([fm fileExistsAtPath:skillMd]) {
                 NSString *name = nil;
+                NSString *mdDisplayName = nil;
                 NSString *summary = nil;
-                IMParseSkillMarkdownFile(skillMd, entry, &name, &summary);
+                IMParseSkillMarkdownFileEx(skillMd, entry, &name, &mdDisplayName, &summary);
+                NSString *yamlDisplayName = nil;
+                NSString *yamlShortDesc = nil;
+                IMParseOpenAIYamlMetadata(resolvedPath, &yamlDisplayName, &yamlShortDesc);
+                NSString *humanTitle = yamlDisplayName.length ? yamlDisplayName : mdDisplayName;
                 NSString *key = name.lowercaseString;
                 if (name.length > 0 && !seen[key]) {
                     InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
-                    item.name = name;
-                    item.summary = summary ?: @"";
-                    item.insertPrefix = insertPrefix ?: @"/";
-                    item.sourceLabel = sourceLabel ?: @"";
+                    IMConfigureSkillOrWorkflowItem(item, name, humanTitle, yamlShortDesc, summary, insertPrefix, sourceLabel, skillMd, NO);
                     seen[key] = item;
                     [outItems addObject:item];
                 }
             } else if (maxSubdirDepth > 0) {
-                IMScanSkillDirectory(resolvedPath, sourceLabel, insertPrefix, maxSubdirDepth - 1, seen, outItems);
+                IMScanSkillDirectoryEx(resolvedPath, sourceLabel, insertPrefix, maxSubdirDepth - 1, treatLooseMarkdownAsWorkflow, seen, outItems);
             }
         } else if ([entry.pathExtension.lowercaseString isEqualToString:@"md"] &&
                    ![entry.lowercaseString isEqualToString:@"readme.md"]) {
             NSString *fallback = [entry stringByDeletingPathExtension];
             NSString *name = nil;
+            NSString *mdDisplayName = nil;
             NSString *summary = nil;
-            IMParseSkillMarkdownFile(resolvedPath, fallback, &name, &summary);
+            IMParseSkillMarkdownFileEx(resolvedPath, fallback, &name, &mdDisplayName, &summary);
             NSString *key = name.lowercaseString;
             if (name.length > 0 && !seen[key]) {
                 InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
-                item.name = name;
-                item.summary = summary ?: @"";
-                item.insertPrefix = insertPrefix ?: @"/";
-                item.sourceLabel = sourceLabel ?: @"";
+                IMConfigureSkillOrWorkflowItem(item, name, mdDisplayName, nil, summary, insertPrefix, sourceLabel, resolvedPath, treatLooseMarkdownAsWorkflow);
                 seen[key] = item;
                 [outItems addObject:item];
             }
         }
     }
+}
+
+static void IMScanSkillDirectory(NSString *dirPath,
+                                 NSString *sourceLabel,
+                                 NSString *insertPrefix,
+                                 NSInteger maxSubdirDepth,
+                                 NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen,
+                                 NSMutableArray<InputMirrorSkillItem *> *outItems) {
+    IMScanSkillDirectoryEx(dirPath, sourceLabel, insertPrefix, maxSubdirDepth, NO, seen, outItems);
 }
 
 static NSString *IMSkillAppFamilyKey(NSString *bundleID, NSString *appName) {
@@ -1241,23 +1525,134 @@ static NSString *IMSkillAppFamilyKey(NSString *bundleID, NSString *appName) {
     return @"generic";
 }
 
-NSArray<InputMirrorSkillItem *> *InputMirrorLoadSkillsForApp(NSString *bundleID,
-                                                             NSString *appName,
-                                                             NSString *homeDirOverride) {
+static InputMirrorSkillItem *IMMakeSlashCommand(NSString *name,
+                                                NSString *detailTitle,
+                                                NSString *summary,
+                                                NSString *keywords,
+                                                NSString *symbolName,
+                                                BOOL requiresNativeHandoff,
+                                                BOOL autoConfirm) {
+    InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
+    item.name = name;
+    item.displayTitle = [@"/" stringByAppendingString:name];
+    item.displayDetail = detailTitle ?: @"";
+    item.summary = summary ?: @"";
+    item.insertPrefix = @"/";
+    item.sourceLabel = @"命令";
+    item.categoryKey = @"commands";
+    item.searchKeywords = keywords ?: @"";
+    item.symbolName = symbolName.length ? symbolName : @"terminal";
+    item.itemKind = InputMirrorItemKindSlashCommand;
+    item.requiresNativeHandoff = requiresNativeHandoff;
+    item.autoConfirmOnNativeHandoff = autoConfirm;
+    return item;
+}
+
+NSArray<InputMirrorSkillItem *> *InputMirrorLoadSlashCommandsForApp(NSString *bundleID,
+                                                                     NSString *appName) {
+    NSString *family = IMSkillAppFamilyKey(bundleID, appName);
+    if ([family isEqualToString:@"codex"]) {
+        // Official Codex Desktop composer slash commands (executes or opens native submenu in Codex)
+        return @[
+            IMMakeSlashCommand(@"review", @"代码审查", @"审查当前工作区或分支的代码变更", @"review cr diff 代码审查 检视", @"magnifyingglass", YES, YES),
+            IMMakeSlashCommand(@"plan", @"计划模式", @"开启或关闭 Plan 规划模式", @"plan mode 计划 规划 方案", @"list.bullet.clipboard", YES, YES),
+            IMMakeSlashCommand(@"compact", @"压缩上下文", @"压缩当前对话上下文，释放窗口空间", @"compact summarize 压缩 总结 上下文", @"arrow.down.right.and.arrow.up.left", YES, YES),
+            IMMakeSlashCommand(@"fast", @"快速模式", @"切换高速推理档位与标准速度", @"fast speed 快速 加速 速度", @"bolt", YES, YES),
+            IMMakeSlashCommand(@"model", @"切换模型", @"选择或切换当前对话使用的模型", @"model 模型 切换 gpt codex o3", @"cpu", YES, YES),
+            IMMakeSlashCommand(@"reasoning", @"推理强度", @"调整模型思考与推理深度档位", @"reasoning effort 推理 思考 深度", @"brain", YES, YES),
+            IMMakeSlashCommand(@"new", @"新建对话", @"在当前工作区开启空白新对话", @"new chat 新建 新对话 清空", @"plus.bubble", YES, YES),
+            IMMakeSlashCommand(@"fork", @"分支对话", @"从当前对话创建分支或隔离 Worktree 对话", @"fork branch 分支 派生", @"arrow.triangle.branch", YES, YES),
+            IMMakeSlashCommand(@"worktree", @"Worktree 模式", @"切换在独立 Git Worktree 中运行当前对话", @"worktree git 隔离 分支目录", @"folder.badge.gearshape", YES, YES),
+            IMMakeSlashCommand(@"local", @"本地运行", @"切换在当前本地工作区直接运行对话", @"local 本地 工作区", @"laptopcomputer", YES, YES),
+            IMMakeSlashCommand(@"status", @"会话状态", @"查看会话 ID、上下文占用与速率限制", @"status token context 状态 额度 上下文", @"chart.bar", YES, YES),
+            IMMakeSlashCommand(@"mcp", @"MCP 状态", @"查看已连接的 MCP 服务与工具状态", @"mcp server tools 工具 服务", @"server.rack", YES, YES),
+            IMMakeSlashCommand(@"memories", @"对话记忆", @"管理当前对话的记忆读取与生成开关", @"memories memory 记忆", @"memorychip", YES, YES),
+            IMMakeSlashCommand(@"init", @"初始化指引", @"扫描仓库并生成 AGENTS.md 项目指引文件", @"init agents.md 初始化", @"doc.badge.plus", YES, YES),
+            IMMakeSlashCommand(@"goal", @"持续目标", @"设定让 Codex 持续追踪推进的目标任务", @"goal 目标 巡航", @"target", YES, YES),
+            IMMakeSlashCommand(@"side", @"侧边对话", @"开启不打断主线程的侧边快速问答窗口", @"side chat 侧边 副对话 旁路", @"sidebar.right", YES, YES),
+            IMMakeSlashCommand(@"ide", @"IDE 上下文", @"开关自动附带 IDE 当前选中代码与打开文件", @"ide context vscode cursor 编辑器 选中", @"curlybraces", YES, YES),
+            IMMakeSlashCommand(@"rename", @"重命名对话", @"修改当前对话标题", @"rename title 重命名 改名", @"pencil", YES, YES),
+            IMMakeSlashCommand(@"pin", @"置顶对话", @"将当前对话固定在侧边栏顶部", @"pin star 置顶 收藏", @"pin", YES, YES),
+            IMMakeSlashCommand(@"archive", @"归档对话", @"归档当前对话", @"archive 归档", @"archivebox", YES, YES),
+            IMMakeSlashCommand(@"pet", @"桌面宠物", @"唤醒或收起 Codex 桌面宠物", @"pet 宠物", @"pawprint", YES, YES),
+            IMMakeSlashCommand(@"usage", @"用量与账单", @"打开用量统计与账单设置", @"usage billing 用量 额度 账单", @"gauge.medium", YES, YES),
+        ];
+    } else if ([family isEqualToString:@"antigravity"]) {
+        // Official Antigravity slash workflows & commands
+        return @[
+            IMMakeSlashCommand(@"plan", @"分步规划", @"先输出可审阅的分步实施计划再执行", @"plan 计划 规划 方案", @"list.bullet.clipboard", NO, NO),
+            IMMakeSlashCommand(@"goal", @"目标巡航", @"长时深度执行复杂任务直至目标达成", @"goal 目标 巡航 挂机 长任务", @"target", NO, NO),
+            IMMakeSlashCommand(@"compact", @"压缩上下文", @"总结并压缩当前对话上下文以释放窗口空间", @"compact 压缩 总结 上下文", @"arrow.down.right.and.arrow.up.left", YES, YES),
+            IMMakeSlashCommand(@"browser", @"浏览器代理", @"启动内置浏览器访问网页、调试本地端口或自动化操作", @"browser web 浏览器 网页 自动化", @"safari", NO, NO),
+            IMMakeSlashCommand(@"grill-me", @"方案拷问", @"通过结构化追问压测需求与架构假设，对齐关键决策", @"grill 拷问 追问 评审 决策", @"questionmark.bubble", NO, NO),
+            IMMakeSlashCommand(@"boost", @"深度增强", @"多视角深度思考、策略拆解与严格验证", @"boost 深度 增强 思考 验证", @"bolt.shield", NO, NO),
+            IMMakeSlashCommand(@"teamwork", @"多智能体协作", @"组建自主协作子代理团队并行推进大型任务", @"teamwork team 协作 团队 多代理", @"person.3", NO, NO),
+            IMMakeSlashCommand(@"swarm", @"Swarm 蜂群", @"启动共享消息板的多 Worker 蜂群会话", @"swarm 蜂群 并发", @"point.3.connected.trianglepath.dotted", NO, NO),
+            IMMakeSlashCommand(@"schedule", @"定时执行", @"设置周期性计划任务或一次性倒计时提醒", @"schedule cron timer 定时 计划", @"clock.arrow.circlepath", NO, NO),
+            IMMakeSlashCommand(@"automation", @"后台自动化", @"交互式创建定时运行的后台自动化工作流", @"automation 自动化 后台 每天", @"gearshape.2", NO, NO),
+            IMMakeSlashCommand(@"learn", @"沉淀记忆", @"将本次纠正或配置经验持久化为长期规则与技能", @"learn 记忆 学习 沉淀 规则", @"book.closed", NO, NO),
+            IMMakeSlashCommand(@"plugin", @"插件管理", @"启用、禁用、安装或打包 Antigravity 插件", @"plugin 插件 市场 扩展", @"puzzlepiece.extension", NO, NO),
+        ];
+    } else if ([family isEqualToString:@"claude"]) {
+        return @[
+            IMMakeSlashCommand(@"compact", @"压缩上下文", @"压缩当前会话上下文", @"compact 压缩 上下文", @"arrow.down.right.and.arrow.up.left", YES, YES),
+            IMMakeSlashCommand(@"clear", @"清空会话", @"清空当前对话历史重新开始", @"clear reset 清空 新建", @"trash", YES, YES),
+            IMMakeSlashCommand(@"review", @"代码审查", @"审查当前变更或 PR", @"review 审查 代码", @"magnifyingglass", NO, NO),
+            IMMakeSlashCommand(@"init", @"初始化 CLAUDE.md", @"分析仓库并生成 CLAUDE.md 指引文件", @"init claude.md 初始化", @"doc.badge.plus", YES, YES),
+            IMMakeSlashCommand(@"model", @"切换模型", @"切换 Claude 模型", @"model 模型", @"cpu", YES, YES),
+            IMMakeSlashCommand(@"mcp", @"MCP 状态", @"查看和管理 MCP 服务连接", @"mcp 工具 服务", @"server.rack", YES, YES),
+            IMMakeSlashCommand(@"memory", @"编辑记忆", @"查看或编辑 CLAUDE.md 记忆文件", @"memory 记忆", @"memorychip", YES, YES),
+            IMMakeSlashCommand(@"cost", @"用量统计", @"查看当前会话 Token 消耗与费用", @"cost usage 费用 用量", @"gauge.medium", YES, YES),
+        ];
+    }
+    return @[];
+}
+
+NSArray<InputMirrorSkillItem *> *InputMirrorLoadSkillsForAppInWorkspace(NSString *bundleID,
+                                                                         NSString *appName,
+                                                                         NSString *workspaceRoot,
+                                                                         NSString *homeDirOverride) {
     NSString *home = homeDirOverride.length ? homeDirOverride : NSHomeDirectory();
     NSString *family = IMSkillAppFamilyKey(bundleID, appName);
     NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen = [NSMutableDictionary dictionary];
     NSMutableArray<InputMirrorSkillItem *> *items = [NSMutableArray array];
+    NSFileManager *fm = NSFileManager.defaultManager;
 
     if ([family isEqualToString:@"codex"]) {
+        if (workspaceRoot.length > 0) {
+            IMScanSkillDirectory([workspaceRoot stringByAppendingPathComponent:@".agents/skills"], @"项目", @"$", 1, seen, items);
+            IMScanSkillDirectory([workspaceRoot stringByAppendingPathComponent:@".codex/skills"], @"项目", @"$", 1, seen, items);
+        }
+        IMScanSkillDirectory([home stringByAppendingPathComponent:@".agents/skills"], @"通用", @"$", 1, seen, items);
         NSString *codexSkills = [home stringByAppendingPathComponent:@".codex/skills"];
         IMScanSkillDirectory(codexSkills, @"Codex", @"$", 1, seen, items);
+        NSString *codexPluginCache = [home stringByAppendingPathComponent:@".codex/plugins/cache"];
+        for (NSString *mkt in [fm contentsOfDirectoryAtPath:codexPluginCache error:nil]) {
+            if ([mkt hasPrefix:@"."]) continue;
+            NSString *mktDir = [codexPluginCache stringByAppendingPathComponent:mkt];
+            for (NSString *plug in [fm contentsOfDirectoryAtPath:mktDir error:nil]) {
+                if ([plug hasPrefix:@"."]) continue;
+                NSString *plugDir = [mktDir stringByAppendingPathComponent:plug];
+                IMScanSkillDirectory([plugDir stringByAppendingPathComponent:@"skills"], @"插件", @"$", 1, seen, items);
+                for (NSString *ver in [fm contentsOfDirectoryAtPath:plugDir error:nil]) {
+                    if ([ver hasPrefix:@"."]) continue;
+                    IMScanSkillDirectory([[plugDir stringByAppendingPathComponent:ver] stringByAppendingPathComponent:@"skills"], @"插件", @"$", 1, seen, items);
+                }
+            }
+        }
         IMScanSkillDirectory([codexSkills stringByAppendingPathComponent:@".system"], @"系统", @"$", 0, seen, items);
     } else if ([family isEqualToString:@"antigravity"]) {
+        if (workspaceRoot.length > 0) {
+            IMScanSkillDirectoryEx([workspaceRoot stringByAppendingPathComponent:@".agent/workflows"], @"工作流", @"/", 1, YES, seen, items);
+            IMScanSkillDirectoryEx([workspaceRoot stringByAppendingPathComponent:@".agents/workflows"], @"工作流", @"/", 1, YES, seen, items);
+            IMScanSkillDirectory([workspaceRoot stringByAppendingPathComponent:@".agents/skills"], @"项目", @"/", 1, seen, items);
+            IMScanSkillDirectory([workspaceRoot stringByAppendingPathComponent:@".agent/skills"], @"项目", @"/", 1, seen, items);
+        }
+        IMScanSkillDirectoryEx([home stringByAppendingPathComponent:@".gemini/antigravity/global_workflows"], @"工作流", @"/", 1, YES, seen, items);
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".gemini/config/skills"], @"自定义", @"/", 1, seen, items);
+        IMScanSkillDirectory([home stringByAppendingPathComponent:@".agents/skills"], @"通用", @"/", 1, seen, items);
         NSString *pluginsRoot = [home stringByAppendingPathComponent:@".gemini/config/plugins"];
-        NSArray<NSString *> *plugins = [NSFileManager.defaultManager contentsOfDirectoryAtPath:pluginsRoot error:nil];
-        for (NSString *plugin in plugins) {
+        for (NSString *plugin in [fm contentsOfDirectoryAtPath:pluginsRoot error:nil]) {
             if ([plugin hasPrefix:@"."]) continue;
             NSString *pluginSkills = [[pluginsRoot stringByAppendingPathComponent:plugin] stringByAppendingPathComponent:@"skills"];
             IMScanSkillDirectory(pluginSkills, @"插件", @"/", 1, seen, items);
@@ -1265,9 +1660,18 @@ NSArray<InputMirrorSkillItem *> *InputMirrorLoadSkillsForApp(NSString *bundleID,
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".gemini/antigravity/skills"], @"Antigravity", @"/", 1, seen, items);
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".gemini/antigravity/builtin/skills"], @"内置", @"/", 1, seen, items);
     } else if ([family isEqualToString:@"claude"]) {
+        if (workspaceRoot.length > 0) {
+            IMScanSkillDirectory([workspaceRoot stringByAppendingPathComponent:@".claude/commands"], @"项目命令", @"/", 1, seen, items);
+            IMScanSkillDirectory([workspaceRoot stringByAppendingPathComponent:@".claude/skills"], @"项目", @"/", 1, seen, items);
+        }
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".claude/skills"], @"Claude", @"/", 1, seen, items);
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".claude/commands"], @"命令", @"/", 1, seen, items);
+        IMScanSkillDirectory([home stringByAppendingPathComponent:@".agents/skills"], @"通用", @"/", 1, seen, items);
     } else if ([family isEqualToString:@"cursor"]) {
+        if (workspaceRoot.length > 0) {
+            IMScanSkillDirectory([workspaceRoot stringByAppendingPathComponent:@".cursor/commands"], @"项目", @"/", 1, seen, items);
+            IMScanSkillDirectory([workspaceRoot stringByAppendingPathComponent:@".cursor/skills"], @"项目", @"/", 1, seen, items);
+        }
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".cursor/commands"], @"Cursor", @"/", 1, seen, items);
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".cursor/skills"], @"Cursor", @"/", 1, seen, items);
     } else if ([family isEqualToString:@"codebuddy"]) {
@@ -1277,6 +1681,7 @@ NSArray<InputMirrorSkillItem *> *InputMirrorLoadSkillsForApp(NSString *bundleID,
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".qoder/skills"], @"Qoder", @"/", 1, seen, items);
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".qoder-cn/skills"], @"Qoder", @"/", 1, seen, items);
     } else {
+        IMScanSkillDirectory([home stringByAppendingPathComponent:@".agents/skills"], @"通用", @"/", 1, seen, items);
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".codex/skills"], @"Codex", @"/", 1, seen, items);
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".claude/skills"], @"Claude", @"/", 1, seen, items);
         IMScanSkillDirectory([home stringByAppendingPathComponent:@".gemini/config/skills"], @"技能", @"/", 1, seen, items);
@@ -1284,21 +1689,46 @@ NSArray<InputMirrorSkillItem *> *InputMirrorLoadSkillsForApp(NSString *bundleID,
     return items;
 }
 
+NSArray<InputMirrorSkillItem *> *InputMirrorLoadSkillsForApp(NSString *bundleID,
+                                                             NSString *appName,
+                                                             NSString *homeDirOverride) {
+    return InputMirrorLoadSkillsForAppInWorkspace(bundleID, appName, nil, homeDirOverride);
+}
+
+static InputMirrorSkillItem *IMAddMentionItemEx(NSString *name,
+                                                NSString *displayTitle,
+                                                NSString *displayDetail,
+                                                NSString *summary,
+                                                NSString *sourceLabel,
+                                                NSString *categoryKey,
+                                                NSString *symbolName,
+                                                InputMirrorItemKind kind,
+                                                NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen,
+                                                NSMutableArray<InputMirrorSkillItem *> *outItems) {
+    if (!name.length) return nil;
+    NSString *key = name.lowercaseString;
+    if (seen[key]) return seen[key];
+    InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
+    item.name = name;
+    item.displayTitle = displayTitle.length ? displayTitle : [@"@" stringByAppendingString:name];
+    item.displayDetail = displayDetail ?: @"";
+    item.summary = summary ?: @"";
+    item.insertPrefix = @"@";
+    item.sourceLabel = sourceLabel ?: @"引用";
+    item.categoryKey = categoryKey ?: @"context";
+    item.symbolName = symbolName ?: @"at";
+    item.itemKind = kind;
+    seen[key] = item;
+    [outItems addObject:item];
+    return item;
+}
+
 static void IMAddMentionItem(NSString *name,
                              NSString *summary,
                              NSString *sourceLabel,
                              NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen,
                              NSMutableArray<InputMirrorSkillItem *> *outItems) {
-    if (!name.length) return;
-    NSString *key = name.lowercaseString;
-    if (seen[key]) return;
-    InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
-    item.name = name;
-    item.summary = summary ?: @"";
-    item.insertPrefix = @"@";
-    item.sourceLabel = sourceLabel ?: @"引用";
-    seen[key] = item;
-    [outItems addObject:item];
+    IMAddMentionItemEx(name, [@"@" stringByAppendingString:name], @"", summary, sourceLabel, @"context", @"sparkles.rectangle.stack", InputMirrorItemKindContext, seen, outItems);
 }
 
 static NSSet<NSString *> *IMIgnoredWorkspaceDirs(void) {
@@ -1314,6 +1744,70 @@ static NSSet<NSString *> *IMIgnoredWorkspaceDirs(void) {
     return ignored;
 }
 
+static BOOL IMShouldIgnoreRelativeFile(NSString *relPath, NSSet<NSString *> *ignoredDirs) {
+    if (!relPath.length) return YES;
+    NSString *lower = relPath.lowercaseString;
+    if ([lower hasSuffix:@".ds_store"] || [lower hasSuffix:@".dmg"] || [lower hasSuffix:@".zip"] ||
+        [lower hasSuffix:@".o"] || [lower hasSuffix:@".pyc"] || [lower hasSuffix:@".icns"] ||
+        [lower hasSuffix:@".asar"]) {
+        return YES;
+    }
+    NSArray<NSString *> *parts = [relPath componentsSeparatedByString:@"/"];
+    for (NSUInteger i = 0; i < parts.count; i++) {
+        NSString *comp = parts[i];
+        if (!comp.length) continue;
+        if ([comp hasPrefix:@"."] && ![comp isEqualToString:@".github"] && ![comp isEqualToString:@".gitignore"] && ![comp isEqualToString:@".env.example"]) {
+            return YES;
+        }
+        if (i + 1 < parts.count && [ignoredDirs containsObject:comp.lowercaseString]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static NSString *IMFileSymbolForExtension(NSString *ext) {
+    NSString *e = ext.lowercaseString ?: @"";
+    if ([e isEqualToString:@"m"] || [e isEqualToString:@"mm"] || [e isEqualToString:@"h"] ||
+        [e isEqualToString:@"c"] || [e isEqualToString:@"cpp"] || [e isEqualToString:@"swift"] ||
+        [e isEqualToString:@"py"] || [e isEqualToString:@"js"] || [e isEqualToString:@"ts"] ||
+        [e isEqualToString:@"tsx"] || [e isEqualToString:@"jsx"] || [e isEqualToString:@"go"] ||
+        [e isEqualToString:@"rs"] || [e isEqualToString:@"java"] || [e isEqualToString:@"sh"]) {
+        return @"chevron.left.forwardslash.chevron.right";
+    }
+    if ([e isEqualToString:@"md"] || [e isEqualToString:@"txt"] || [e isEqualToString:@"rst"]) {
+        return @"doc.text";
+    }
+    if ([e isEqualToString:@"json"] || [e isEqualToString:@"yaml"] || [e isEqualToString:@"yml"] ||
+        [e isEqualToString:@"toml"] || [e isEqualToString:@"plist"]) {
+        return @"gearshape";
+    }
+    return @"doc";
+}
+
+static NSArray<NSString *> *IMGitListWorkspaceFiles(NSString *workspaceRoot) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (![fm fileExistsAtPath:[workspaceRoot stringByAppendingPathComponent:@".git"]]) return nil;
+    if (![fm isExecutableFileAtPath:@"/usr/bin/git"]) return nil;
+
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/git"];
+    task.arguments = @[@"-C", workspaceRoot, @"ls-files", @"-co", @"--exclude-standard"];
+    NSPipe *outPipe = [NSPipe pipe];
+    task.standardOutput = outPipe;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    NSError *err = nil;
+    if (![task launchAndReturnError:&err]) return nil;
+
+    NSData *data = [outPipe.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    if (task.terminationStatus != 0 || !data.length) return nil;
+
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!text.length) return nil;
+    return [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
+}
+
 static void IMScanWorkspaceMentions(NSString *workspaceRoot,
                                     NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen,
                                     NSMutableArray<InputMirrorSkillItem *> *outItems) {
@@ -1323,52 +1817,175 @@ static void IMScanWorkspaceMentions(NSString *workspaceRoot,
     if (![fm fileExistsAtPath:workspaceRoot isDirectory:&isDir] || !isDir) return;
 
     NSSet<NSString *> *ignoredDirs = IMIgnoredWorkspaceDirs();
-    const NSUInteger kMaxEntries = 280;
-    const NSUInteger kMaxDepth = 4;
+    const NSUInteger kMaxFiles = 2400;
+    NSMutableArray<InputMirrorSkillItem *> *fileItems = [NSMutableArray array];
+    NSMutableArray<InputMirrorSkillItem *> *folderItems = [NSMutableArray array];
+    NSMutableSet<NSString *> *seenFolders = [NSMutableSet set];
 
-    NSMutableArray<NSDictionary *> *queue = [NSMutableArray arrayWithObject:@{
-        @"abs": workspaceRoot,
-        @"rel": @"",
-        @"depth": @(0)
-    }];
-    NSUInteger cursor = 0;
-    NSUInteger addedCount = 0;
+    NSArray<NSString *> *gitFiles = IMGitListWorkspaceFiles(workspaceRoot);
+    NSUInteger statBudget = 520;
 
-    while (cursor < queue.count && addedCount < kMaxEntries) {
-        NSDictionary *node = queue[cursor++];
-        NSString *absDir = node[@"abs"];
-        NSString *relDir = node[@"rel"];
-        NSUInteger depth = [node[@"depth"] unsignedIntegerValue];
+    if (gitFiles.count > 0) {
+        for (NSString *rawRel in gitFiles) {
+            if (fileItems.count >= kMaxFiles) break;
+            if (!rawRel.length || IMShouldIgnoreRelativeFile(rawRel, ignoredDirs)) continue;
+            NSString *absPath = [workspaceRoot stringByAppendingPathComponent:rawRel];
+            BOOL subDir = NO;
+            if (![fm fileExistsAtPath:absPath isDirectory:&subDir] || subDir) continue;
 
-        NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:absDir error:nil];
-        if (!entries.count) continue;
-        entries = [entries sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-
-        for (NSString *entry in entries) {
-            if (addedCount >= kMaxEntries) break;
-            if ([entry hasPrefix:@"."]) continue;
-            NSString *lower = entry.lowercaseString;
-            NSString *fullPath = [absDir stringByAppendingPathComponent:entry];
-            BOOL entryIsDir = NO;
-            if (![fm fileExistsAtPath:fullPath isDirectory:&entryIsDir]) continue;
-            if (entryIsDir && [ignoredDirs containsObject:lower]) continue;
-            if (!entryIsDir && ([lower isEqualToString:@".ds_store"] || [lower hasSuffix:@".dmg"] || [lower hasSuffix:@".zip"])) continue;
-
-            NSString *relPath = relDir.length ? [relDir stringByAppendingPathComponent:entry] : entry;
-            if (entryIsDir) {
-                if (depth <= 1) {
-                    NSString *dirName = [relPath stringByAppendingString:@"/"];
-                    IMAddMentionItem(dirName, [NSString stringWithFormat:@"目录 · %@", dirName], @"目录", seen, outItems);
-                    addedCount++;
+            // Collect top 2 directory levels as mentionable folders (just like Codex & Antigravity)
+            NSArray<NSString *> *comps = [rawRel componentsSeparatedByString:@"/"];
+            if (comps.count >= 2) {
+                NSString *d1 = [comps[0] stringByAppendingString:@"/"];
+                if (![seenFolders containsObject:d1.lowercaseString]) {
+                    [seenFolders addObject:d1.lowercaseString];
+                    InputMirrorSkillItem *fItem = [[InputMirrorSkillItem alloc] init];
+                    fItem.name = d1;
+                    fItem.displayTitle = d1;
+                    fItem.displayDetail = @"工作区目录";
+                    fItem.summary = [NSString stringWithFormat:@"引用目录 · %@", d1];
+                    fItem.insertPrefix = @"@";
+                    fItem.sourceLabel = @"目录";
+                    fItem.categoryKey = @"files";
+                    fItem.symbolName = @"folder";
+                    fItem.filePath = [workspaceRoot stringByAppendingPathComponent:comps[0]];
+                    fItem.itemKind = InputMirrorItemKindFolder;
+                    [folderItems addObject:fItem];
                 }
-                if (depth < kMaxDepth) {
-                    [queue addObject:@{ @"abs": fullPath, @"rel": relPath, @"depth": @(depth + 1) }];
+                if (comps.count >= 3 && folderItems.count < 60) {
+                    NSString *d2 = [NSString stringWithFormat:@"%@/%@/", comps[0], comps[1]];
+                    if (![seenFolders containsObject:d2.lowercaseString]) {
+                        [seenFolders addObject:d2.lowercaseString];
+                        InputMirrorSkillItem *fItem2 = [[InputMirrorSkillItem alloc] init];
+                        fItem2.name = d2;
+                        fItem2.displayTitle = [comps[1] stringByAppendingString:@"/"];
+                        fItem2.displayDetail = [comps[0] stringByAppendingString:@"/"];
+                        fItem2.summary = [NSString stringWithFormat:@"引用子目录 · %@", d2];
+                        fItem2.insertPrefix = @"@";
+                        fItem2.sourceLabel = @"目录";
+                        fItem2.categoryKey = @"files";
+                        fItem2.symbolName = @"folder";
+                        fItem2.filePath = [[workspaceRoot stringByAppendingPathComponent:comps[0]] stringByAppendingPathComponent:comps[1]];
+                        fItem2.itemKind = InputMirrorItemKindFolder;
+                        [folderItems addObject:fItem2];
+                    }
                 }
-            } else {
-                NSString *parentDesc = relDir.length ? [NSString stringWithFormat:@"文件 · %@/", relDir] : @"工作区根目录文件";
-                IMAddMentionItem(relPath, parentDesc, @"文件", seen, outItems);
-                addedCount++;
             }
+
+            NSString *baseName = rawRel.lastPathComponent ?: rawRel;
+            NSString *parentRel = [rawRel stringByDeletingLastPathComponent];
+            InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
+            item.name = rawRel;
+            item.displayTitle = baseName;
+            item.displayDetail = parentRel.length ? [parentRel stringByAppendingString:@"/"] : @"根目录";
+            item.summary = parentRel.length ? [NSString stringWithFormat:@"%@/", parentRel] : @"工作区根目录文件";
+            item.insertPrefix = @"@";
+            item.sourceLabel = @"文件";
+            item.categoryKey = @"files";
+            item.symbolName = IMFileSymbolForExtension(baseName.pathExtension);
+            item.filePath = absPath;
+            item.itemKind = InputMirrorItemKindFile;
+            if (statBudget > 0) {
+                statBudget--;
+                struct stat st;
+                if (stat(absPath.fileSystemRepresentation, &st) == 0) {
+                    item.recencyScore = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec * 1e-9;
+                }
+            }
+            [fileItems addObject:item];
+        }
+    } else {
+        const NSUInteger kMaxDepth = 5;
+        NSMutableArray<NSDictionary *> *queue = [NSMutableArray arrayWithObject:@{
+            @"abs": workspaceRoot,
+            @"rel": @"",
+            @"depth": @(0)
+        }];
+        NSUInteger cursor = 0;
+        while (cursor < queue.count && (fileItems.count + folderItems.count) < kMaxFiles) {
+            NSDictionary *node = queue[cursor++];
+            NSString *absDir = node[@"abs"];
+            NSString *relDir = node[@"rel"];
+            NSUInteger depth = [node[@"depth"] unsignedIntegerValue];
+
+            NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:absDir error:nil];
+            if (!entries.count) continue;
+            entries = [entries sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+
+            for (NSString *entry in entries) {
+                if ((fileItems.count + folderItems.count) >= kMaxFiles) break;
+                if ([entry hasPrefix:@"."]) continue;
+                NSString *lower = entry.lowercaseString;
+                NSString *fullPath = [absDir stringByAppendingPathComponent:entry];
+                BOOL entryIsDir = NO;
+                if (![fm fileExistsAtPath:fullPath isDirectory:&entryIsDir]) continue;
+                if (entryIsDir && [ignoredDirs containsObject:lower]) continue;
+                if (!entryIsDir && ([lower isEqualToString:@".ds_store"] || [lower hasSuffix:@".dmg"] || [lower hasSuffix:@".zip"])) continue;
+
+                NSString *relPath = relDir.length ? [relDir stringByAppendingPathComponent:entry] : entry;
+                if (entryIsDir) {
+                    if (depth <= 1) {
+                        NSString *dirName = [relPath stringByAppendingString:@"/"];
+                        InputMirrorSkillItem *fItem = [[InputMirrorSkillItem alloc] init];
+                        fItem.name = dirName;
+                        fItem.displayTitle = [entry stringByAppendingString:@"/"];
+                        fItem.displayDetail = relDir.length ? [relDir stringByAppendingString:@"/"] : @"工作区目录";
+                        fItem.summary = [NSString stringWithFormat:@"引用目录 · %@", dirName];
+                        fItem.insertPrefix = @"@";
+                        fItem.sourceLabel = @"目录";
+                        fItem.categoryKey = @"files";
+                        fItem.symbolName = @"folder";
+                        fItem.filePath = fullPath;
+                        fItem.itemKind = InputMirrorItemKindFolder;
+                        [folderItems addObject:fItem];
+                    }
+                    if (depth < kMaxDepth) {
+                        [queue addObject:@{ @"abs": fullPath, @"rel": relPath, @"depth": @(depth + 1) }];
+                    }
+                } else {
+                    InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
+                    item.name = relPath;
+                    item.displayTitle = entry;
+                    item.displayDetail = relDir.length ? [relDir stringByAppendingString:@"/"] : @"根目录";
+                    item.summary = relDir.length ? [NSString stringWithFormat:@"%@/", relDir] : @"工作区根目录文件";
+                    item.insertPrefix = @"@";
+                    item.sourceLabel = @"文件";
+                    item.categoryKey = @"files";
+                    item.symbolName = IMFileSymbolForExtension(entry.pathExtension);
+                    item.filePath = fullPath;
+                    item.itemKind = InputMirrorItemKindFile;
+                    if (statBudget > 0) {
+                        statBudget--;
+                        struct stat st;
+                        if (stat(fullPath.fileSystemRepresentation, &st) == 0) {
+                            item.recencyScore = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec * 1e-9;
+                        }
+                    }
+                    [fileItems addObject:item];
+                }
+            }
+        }
+    }
+
+    // Sort files by recent modification time descending so empty '@' immediately surfaces active files (just like Codex & Antigravity)
+    [fileItems sortUsingComparator:^NSComparisonResult(InputMirrorSkillItem *a, InputMirrorSkillItem *b) {
+        if (a.recencyScore > b.recencyScore) return NSOrderedAscending;
+        if (a.recencyScore < b.recencyScore) return NSOrderedDescending;
+        return [a.name localizedCaseInsensitiveCompare:b.name];
+    }];
+
+    for (InputMirrorSkillItem *fi in fileItems) {
+        NSString *k = fi.name.lowercaseString;
+        if (k.length && !seen[k]) {
+            seen[k] = fi;
+            [outItems addObject:fi];
+        }
+    }
+    for (InputMirrorSkillItem *di in folderItems) {
+        NSString *k = di.name.lowercaseString;
+        if (k.length && !seen[k]) {
+            seen[k] = di;
+            [outItems addObject:di];
         }
     }
 }
@@ -1451,6 +2068,28 @@ static NSString *IMResolveVSCodeStorageWorkspace(NSString *home, NSArray<NSStrin
     return nil;
 }
 
+static NSString *IMQueryBoundSQLiteText(NSString *dbPath, const char *sql, NSString *param1) {
+    if (!dbPath.length || !param1.length || ![NSFileManager.defaultManager fileExistsAtPath:dbPath]) return nil;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(dbPath.fileSystemRepresentation, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK || !db) {
+        if (db) sqlite3_close(db);
+        return nil;
+    }
+    sqlite3_busy_timeout(db, 80);
+    sqlite3_stmt *stmt = NULL;
+    NSString *result = nil;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK && stmt) {
+        sqlite3_bind_text(stmt, 1, param1.UTF8String, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char *txt = sqlite3_column_text(stmt, 0);
+            if (txt) result = [NSString stringWithUTF8String:(const char *)txt];
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    return result;
+}
+
 NSString *InputMirrorResolveWorkspaceRootForApp(NSString *bundleID,
                                                 NSString *appName,
                                                 NSString *homeDirOverride) {
@@ -1458,7 +2097,48 @@ NSString *InputMirrorResolveWorkspaceRootForApp(NSString *bundleID,
     NSString *family = IMSkillAppFamilyKey(bundleID, appName);
 
     if ([family isEqualToString:@"codex"]) {
-        // 1. Codex global state: selected-project -> local-projects[id].rootPaths, or active-workspace-roots
+        NSString *codexStateDB = [home stringByAppendingPathComponent:@".codex/.codex-global-state.sqlite"];
+        NSString *codexDB = [home stringByAppendingPathComponent:@".codex/state_5.sqlite"];
+
+        // 1. Live Codex SQLite global state (.codex-global-state.sqlite -> selected-project -> local-projects or state_5.project_roots)
+        NSString *selJson = IMQuerySingleSQLiteText(codexStateDB, "SELECT value FROM settings WHERE scope = 'global' AND key LIKE 'electron-owner-value:selected-project:%' LIMIT 1;");
+        if (selJson.length) {
+            id selObj = [NSJSONSerialization JSONObjectWithData:[selJson dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+            if ([selObj isKindOfClass:NSDictionary.class]) {
+                NSString *projId = [((NSDictionary *)selObj)[@"projectId"] isKindOfClass:NSString.class] ? ((NSDictionary *)selObj)[@"projectId"] : nil;
+                if (projId.length) {
+                    NSString *lpJson = IMQuerySingleSQLiteText(codexStateDB, "SELECT value FROM settings WHERE scope = 'global' AND key = 'local-projects' LIMIT 1;");
+                    if (lpJson.length) {
+                        id lpObj = [NSJSONSerialization JSONObjectWithData:[lpJson dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                        NSDictionary *proj = ([lpObj isKindOfClass:NSDictionary.class] && [((NSDictionary *)lpObj)[projId] isKindOfClass:NSDictionary.class]) ? ((NSDictionary *)lpObj)[projId] : nil;
+                        NSArray *roots = [proj[@"rootPaths"] isKindOfClass:NSArray.class] ? proj[@"rootPaths"] : nil;
+                        for (id r in roots) {
+                            if ([r isKindOfClass:NSString.class]) {
+                                NSString *dir = IMExistingDirectoryPathFromURIOrPath((NSString *)r);
+                                if (dir.length) return dir;
+                            }
+                        }
+                    }
+                    NSString *projRoot = IMQueryBoundSQLiteText(codexDB, "SELECT path FROM project_roots WHERE project_id = ? ORDER BY position ASC LIMIT 1;", projId);
+                    NSString *resolvedRoot = IMExistingDirectoryPathFromURIOrPath(projRoot);
+                    if (resolvedRoot.length) return resolvedRoot;
+                }
+            }
+        }
+        NSString *activeRootsJson = IMQuerySingleSQLiteText(codexStateDB, "SELECT value FROM settings WHERE scope = 'global' AND key LIKE 'electron-owner-value:active-workspace-roots:%' LIMIT 1;");
+        if (activeRootsJson.length) {
+            id rootsObj = [NSJSONSerialization JSONObjectWithData:[activeRootsJson dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+            if ([rootsObj isKindOfClass:NSArray.class]) {
+                for (id r in (NSArray *)rootsObj) {
+                    if ([r isKindOfClass:NSString.class]) {
+                        NSString *dir = IMExistingDirectoryPathFromURIOrPath((NSString *)r);
+                        if (dir.length) return dir;
+                    }
+                }
+            }
+        }
+
+        // 2. Legacy JSON state (.codex-global-state.json)
         NSString *statePath = [home stringByAppendingPathComponent:@".codex/.codex-global-state.json"];
         NSData *data = [NSData dataWithContentsOfFile:statePath];
         if (data.length) {
@@ -1497,8 +2177,7 @@ NSString *InputMirrorResolveWorkspaceRootForApp(NSString *bundleID,
                 }
             }
         }
-        // 2. Fallback: most recently updated thread cwd in ~/.codex/state_5.sqlite
-        NSString *codexDB = [home stringByAppendingPathComponent:@".codex/state_5.sqlite"];
+        // 3. Fallback: most recently updated thread cwd in ~/.codex/state_5.sqlite
         NSString *cwd = IMQuerySingleSQLiteText(codexDB, "SELECT cwd FROM threads WHERE cwd IS NOT NULL AND cwd != '' ORDER BY updated_at DESC LIMIT 1;");
         NSString *dir = IMExistingDirectoryPathFromURIOrPath(cwd);
         if (dir.length) return dir;
@@ -1608,11 +2287,66 @@ static void IMLoadAntigravityDBConversations(NSString *home,
             }
             InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
             item.name = title;
+            item.displayTitle = title;
+            item.displayDetail = project ?: @"";
             item.summary = project.length
-                ? [NSString stringWithFormat:@"对话 · %@ · 回车在原应用绑定", project]
+                ? [NSString stringWithFormat:@"历史对话 · %@ · 回车在原应用绑定", project]
                 : @"历史对话 · 回车在原应用绑定";
             item.insertPrefix = @"@";
             item.sourceLabel = @"对话";
+            item.categoryKey = @"chats";
+            item.symbolName = @"bubble.left.and.bubble.right";
+            item.itemKind = InputMirrorItemKindConversation;
+            item.requiresNativeHandoff = YES;
+            seen[dedupKey] = item;
+            [items addObject:item];
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+}
+
+static void IMLoadCodexDBConversations(NSString *home,
+                                       NSUInteger maxCount,
+                                       NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen,
+                                       NSMutableArray<InputMirrorSkillItem *> *items) {
+    NSString *dbPath = [home stringByAppendingPathComponent:@".codex/state_5.sqlite"];
+    const char *sql = "SELECT COALESCE(NULLIF(name,''), title), cwd FROM threads WHERE archived = 0 AND COALESCE(NULLIF(name,''), title) != '' ORDER BY updated_at DESC LIMIT 35;";
+    sqlite3 *db = NULL;
+    if (![NSFileManager.defaultManager fileExistsAtPath:dbPath] ||
+        sqlite3_open_v2(dbPath.fileSystemRepresentation, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK || !db) {
+        if (db) sqlite3_close(db);
+        return;
+    }
+    sqlite3_busy_timeout(db, 80);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK && stmt) {
+        while (sqlite3_step(stmt) == SQLITE_ROW && items.count < maxCount) {
+            const unsigned char *txt = sqlite3_column_text(stmt, 0);
+            if (!txt) continue;
+            NSString *title = IMCleanConversationTitle([NSString stringWithUTF8String:(const char *)txt]);
+            if (title.length < 2) continue;
+            NSString *dedupKey = title.lowercaseString;
+            if (seen[dedupKey]) continue;
+
+            NSString *project = @"";
+            const unsigned char *cwdTxt = sqlite3_column_text(stmt, 1);
+            if (cwdTxt) {
+                NSString *cwd = [NSString stringWithUTF8String:(const char *)cwdTxt];
+                if (cwd.length) project = cwd.lastPathComponent ?: @"";
+            }
+            InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
+            item.name = title;
+            item.displayTitle = title;
+            item.displayDetail = project ?: @"";
+            item.summary = project.length
+                ? [NSString stringWithFormat:@"Codex 对话 · %@ · 回车在原应用绑定", project]
+                : @"Codex 历史对话 · 回车在原应用绑定";
+            item.insertPrefix = @"@";
+            item.sourceLabel = @"对话";
+            item.categoryKey = @"chats";
+            item.symbolName = @"bubble.left.and.bubble.right";
+            item.itemKind = InputMirrorItemKindConversation;
             item.requiresNativeHandoff = YES;
             seen[dedupKey] = item;
             [items addObject:item];
@@ -1632,13 +2366,14 @@ NSArray<InputMirrorSkillItem *> *InputMirrorLoadConversationMentionsForApp(NSStr
     NSMutableArray<InputMirrorSkillItem *> *items = [NSMutableArray array];
     const NSUInteger kMaxConversations = 25;
 
-    // For Antigravity, read official conversation summary titles from conversation_summaries.db FIRST
-    // (snapshot.json stores raw user prompts which do not match Antigravity's native @ conversation search).
+    // Prefer native conversation/thread databases FIRST for Antigravity & Codex
+    // (snapshot.json stores raw first-turn prompts which do not match native @ chat search titles).
     if ([family isEqualToString:@"antigravity"]) {
         IMLoadAntigravityDBConversations(home, kMaxConversations, seen, items);
-        if (items.count > 0) {
-            return items;
-        }
+        if (items.count > 0) return items;
+    } else if ([family isEqualToString:@"codex"]) {
+        IMLoadCodexDBConversations(home, kMaxConversations, seen, items);
+        if (items.count > 0) return items;
     }
 
     NSString *snapPath = [home stringByAppendingPathComponent:@".codex/task-manager/snapshot.json"];
@@ -1677,48 +2412,122 @@ NSArray<InputMirrorSkillItem *> *InputMirrorLoadConversationMentionsForApp(NSStr
                 NSString *project = [rec[@"project"] isKindOfClass:NSString.class] ? rec[@"project"] : @"";
                 InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
                 item.name = title;
+                item.displayTitle = title;
+                item.displayDetail = project ?: @"";
                 item.summary = project.length
                     ? [NSString stringWithFormat:@"对话 · %@ · 回车在原应用绑定", project]
                     : @"历史对话 · 回车在原应用绑定";
                 item.insertPrefix = @"@";
                 item.sourceLabel = @"对话";
+                item.categoryKey = @"chats";
+                item.symbolName = @"bubble.left.and.bubble.right";
+                item.itemKind = InputMirrorItemKindConversation;
                 item.requiresNativeHandoff = YES;
                 seen[dedupKey] = item;
                 [items addObject:item];
             }
         }
     }
+    return items;
+}
 
-    // Fallback to Codex native SQLite database if snapshot.json has no entries
-    if (items.count == 0 && [family isEqualToString:@"codex"]) {
+NSArray<InputMirrorSkillItem *> *InputMirrorLoadExtraMentionsForApp(NSString *bundleID,
+                                                                    NSString *appName,
+                                                                    NSString *workspaceRoot,
+                                                                    NSString *homeDirOverride) {
+    NSString *home = homeDirOverride.length ? homeDirOverride : NSHomeDirectory();
+    NSString *family = IMSkillAppFamilyKey(bundleID, appName);
+    NSMutableDictionary<NSString *, InputMirrorSkillItem *> *seen = [NSMutableDictionary dictionary];
+    NSMutableArray<InputMirrorSkillItem *> *items = [NSMutableArray array];
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    if ([family isEqualToString:@"codex"]) {
+        // 1. Parse MCP servers & enabled plugins from ~/.codex/config.toml
+        NSString *tomlPath = [home stringByAppendingPathComponent:@".codex/config.toml"];
+        NSString *toml = [NSString stringWithContentsOfFile:tomlPath encoding:NSUTF8StringEncoding error:nil];
+        if (toml.length > 0) {
+            NSRegularExpression *mcpRe = IMRegex(@"^\\[mcp_servers\\.\"?([A-Za-z0-9_.-]+)\"?\\]$");
+            NSRegularExpression *plugRe = IMRegex(@"^\\[plugins\\.\"([A-Za-z0-9_.-]+)@([^\"]+)\"\\]$");
+            for (NSString *rawLine in [toml componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+                NSString *line = [rawLine stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                if (!line.length || [line characterAtIndex:0] != '[') continue;
+                NSTextCheckingResult *mm = [mcpRe firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+                if (mm) {
+                    NSString *srv = [line substringWithRange:[mm rangeAtIndex:1]];
+                    InputMirrorSkillItem *it = IMAddMentionItemEx(srv, [@"@" stringByAppendingString:srv], @"MCP 服务", [NSString stringWithFormat:@"引用 MCP 服务 · %@（回车打开原生资源选择）", srv], @"MCP", @"mcp", @"server.rack", InputMirrorItemKindMCP, seen, items);
+                    it.requiresNativeHandoff = YES;
+                    continue;
+                }
+                NSTextCheckingResult *pm = [plugRe firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+                if (pm) {
+                    NSString *plugName = [line substringWithRange:[pm rangeAtIndex:1]];
+                    NSString *mkt = [line substringWithRange:[pm rangeAtIndex:2]];
+                    if ([plugName isEqualToString:@"codex-app-tools"] || [plugName isEqualToString:@"unified-computer-use"]) continue;
+                    InputMirrorSkillItem *it = IMAddMentionItemEx(plugName, [@"@" stringByAppendingString:plugName], mkt, [NSString stringWithFormat:@"Codex 插件能力 · %@", plugName], @"插件", @"mcp", @"puzzlepiece.extension", InputMirrorItemKindMCP, seen, items);
+                    it.requiresNativeHandoff = YES;
+                }
+            }
+        }
+        // 2. Recent named subagents from state_5.sqlite
         NSString *dbPath = [home stringByAppendingPathComponent:@".codex/state_5.sqlite"];
-        const char *sql = "SELECT COALESCE(NULLIF(name,''), title) FROM threads WHERE COALESCE(NULLIF(name,''), title) != '' ORDER BY updated_at DESC LIMIT 25;";
         sqlite3 *db = NULL;
-        if ([NSFileManager.defaultManager fileExistsAtPath:dbPath] &&
-            sqlite3_open_v2(dbPath.fileSystemRepresentation, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK && db) {
-            sqlite3_busy_timeout(db, 80);
+        if ([fm fileExistsAtPath:dbPath] && sqlite3_open_v2(dbPath.fileSystemRepresentation, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK && db) {
+            sqlite3_busy_timeout(db, 60);
             sqlite3_stmt *stmt = NULL;
+            const char *sql = "SELECT DISTINCT agent_nickname, COALESCE(agent_role, '') FROM threads WHERE agent_nickname IS NOT NULL AND agent_nickname != '' ORDER BY updated_at DESC LIMIT 10;";
             if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK && stmt) {
-                while (sqlite3_step(stmt) == SQLITE_ROW && items.count < kMaxConversations) {
-                    const unsigned char *txt = sqlite3_column_text(stmt, 0);
-                    if (!txt) continue;
-                    NSString *title = IMCleanConversationTitle([NSString stringWithUTF8String:(const char *)txt]);
-                    if (title.length < 2) continue;
-                    NSString *dedupKey = title.lowercaseString;
-                    if (seen[dedupKey]) continue;
-                    InputMirrorSkillItem *item = [[InputMirrorSkillItem alloc] init];
-                    item.name = title;
-                    item.summary = @"历史对话 · 回车在原应用绑定";
-                    item.insertPrefix = @"@";
-                    item.sourceLabel = @"对话";
-                    item.requiresNativeHandoff = YES;
-                    seen[dedupKey] = item;
-                    [items addObject:item];
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const unsigned char *nickTxt = sqlite3_column_text(stmt, 0);
+                    if (!nickTxt) continue;
+                    NSString *nick = [NSString stringWithUTF8String:(const char *)nickTxt];
+                    const unsigned char *roleTxt = sqlite3_column_text(stmt, 1);
+                    NSString *role = roleTxt ? [NSString stringWithUTF8String:(const char *)roleTxt] : @"";
+                    InputMirrorSkillItem *it = IMAddMentionItemEx(nick, [@"@" stringByAppendingString:nick], role, role.length ? [NSString stringWithFormat:@"子代理 · %@", role] : @"Codex 子代理", @"智能体", @"mcp", @"cpu", InputMirrorItemKindAgent, seen, items);
+                    it.requiresNativeHandoff = YES;
                 }
                 sqlite3_finalize(stmt);
             }
             sqlite3_close(db);
         }
+    } else if ([family isEqualToString:@"antigravity"]) {
+        // 1. MCP Servers from ~/.gemini/config/mcp_config.json
+        NSString *mcpPath = [home stringByAppendingPathComponent:@".gemini/config/mcp_config.json"];
+        NSData *mcpData = [NSData dataWithContentsOfFile:mcpPath];
+        if (mcpData.length > 0) {
+            id obj = [NSJSONSerialization JSONObjectWithData:mcpData options:0 error:nil];
+            if ([obj isKindOfClass:NSDictionary.class]) {
+                NSDictionary *servers = [((NSDictionary *)obj)[@"mcpServers"] isKindOfClass:NSDictionary.class] ? ((NSDictionary *)obj)[@"mcpServers"] : nil;
+                for (NSString *srv in [servers.allKeys sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)]) {
+                    InputMirrorSkillItem *it = IMAddMentionItemEx(srv, [@"@" stringByAppendingString:srv], @"MCP 服务", [NSString stringWithFormat:@"引用 MCP 服务工具与上下文 · %@", srv], @"MCP", @"mcp", @"server.rack", InputMirrorItemKindMCP, seen, items);
+                    it.requiresNativeHandoff = YES;
+                }
+            }
+        }
+        // 2. Rules (Workspace & Global GEMINI.md / .agents/rules)
+        if (workspaceRoot.length > 0) {
+            for (NSString *ruleRel in @[@"GEMINI.md", @"AGENTS.md", @".cursorrules"]) {
+                NSString *absRule = [workspaceRoot stringByAppendingPathComponent:ruleRel];
+                if ([fm fileExistsAtPath:absRule]) {
+                    IMAddMentionItemEx(ruleRel, ruleRel, @"项目规则", [NSString stringWithFormat:@"引用项目规则文件 · %@", ruleRel], @"规则", @"mcp", @"doc.badge.gearshape", InputMirrorItemKindRule, seen, items);
+                }
+            }
+            for (NSString *rulesSub in @[@".agents/rules", @".agent/rules"]) {
+                NSString *rDir = [workspaceRoot stringByAppendingPathComponent:rulesSub];
+                for (NSString *entry in [fm contentsOfDirectoryAtPath:rDir error:nil]) {
+                    if ([entry hasPrefix:@"."]) continue;
+                    NSString *rel = [rulesSub stringByAppendingPathComponent:entry];
+                    IMAddMentionItemEx(rel, entry, rulesSub, @"项目自定义规则", @"规则", @"mcp", @"doc.badge.gearshape", InputMirrorItemKindRule, seen, items);
+                }
+            }
+        }
+        if ([fm fileExistsAtPath:[home stringByAppendingPathComponent:@".gemini/GEMINI.md"]]) {
+            InputMirrorSkillItem *gRule = IMAddMentionItemEx(@"GEMINI.md", @"GEMINI.md", @"全局规则", @"全局 Antigravity 规则 · ~/.gemini/GEMINI.md", @"规则", @"mcp", @"doc.badge.gearshape", InputMirrorItemKindRule, seen, items);
+            gRule.requiresNativeHandoff = YES;
+        }
+        // 3. Terminal context handoff
+        InputMirrorSkillItem *termItem = IMAddMentionItemEx(@"terminal", @"@terminal", @"终端会话", @"在 Antigravity 原生 @ 菜单中选择活跃终端会话上下文", @"终端", @"mcp", @"terminal", InputMirrorItemKindContext, seen, items);
+        termItem.searchKeywords = @"terminal shell 终端 命令行";
+        termItem.requiresNativeHandoff = YES;
     }
     return items;
 }
@@ -1769,14 +2578,19 @@ NSArray<InputMirrorSkillItem *> *InputMirrorLoadMentionsForApp(NSString *bundleI
     } else if ([family isEqualToString:@"opencode"]) {
         IMAddMentionItem(@"general", @"委派给通用子代理处理复杂任务", @"智能体", seen, items);
         IMAddMentionItem(@"explore", @"委派给代码探索子代理检索仓库", @"智能体", seen, items);
-    } else if ([family isEqualToString:@"antigravity"]) {
-        IMAddMentionItem(@"Files", @"引用工作区文件", @"上下文", seen, items);
-        IMAddMentionItem(@"Folders", @"引用工作区目录", @"上下文", seen, items);
-        IMAddMentionItem(@"Web", @"引用网页或联网检索", @"上下文", seen, items);
     }
 
     if (workspaceRoot.length > 0) {
         IMScanWorkspaceMentions(workspaceRoot, seen, items);
+    }
+    if ([family isEqualToString:@"antigravity"] || [family isEqualToString:@"codex"]) {
+        for (InputMirrorSkillItem *extra in InputMirrorLoadExtraMentionsForApp(bundleID, appName, workspaceRoot, nil)) {
+            NSString *k = extra.name.lowercaseString;
+            if (k.length && !seen[k]) {
+                seen[k] = extra;
+                [items addObject:extra];
+            }
+        }
     }
     return items;
 }
@@ -1795,42 +2609,121 @@ static BOOL IMIsSubsequenceMatch(NSString *haystack, NSString *needle) {
     return ni == nLen;
 }
 
+static NSString *IMIdentifierAcronym(NSString *raw) {
+    if (!raw.length) return @"";
+    NSMutableString *out = [NSMutableString string];
+    BOOL prevBoundary = YES;
+    for (NSUInteger i = 0; i < raw.length; i++) {
+        unichar c = [raw characterAtIndex:i];
+        if (c == '-' || c == '_' || c == '.' || c == '/' || c == ' ') {
+            prevBoundary = YES;
+            continue;
+        }
+        BOOL isUpper = (c >= 'A' && c <= 'Z');
+        if (prevBoundary || isUpper) {
+            unichar lower = isUpper ? (unichar)(c + 32) : c;
+            [out appendFormat:@"%C", lower];
+        }
+        prevBoundary = NO;
+    }
+    return out;
+}
+
+static NSInteger IMScoreSkillItemForQuery(InputMirrorSkillItem *item, NSString *q) {
+    NSString *nameRaw = item.name ?: @"";
+    NSString *nameLower = nameRaw.lowercaseString;
+    NSString *trimmedSlash = [nameLower hasSuffix:@"/"] ? [nameLower substringToIndex:nameLower.length - 1] : nameLower;
+    NSString *baseRaw = (nameRaw.lastPathComponent ?: nameRaw);
+    NSString *baseLower = trimmedSlash.lastPathComponent ?: trimmedSlash;
+    NSString *stemLower = [baseLower stringByDeletingPathExtension];
+    NSString *titleRaw = item.displayTitle ?: @"";
+    if ([titleRaw hasPrefix:@"@"] || [titleRaw hasPrefix:@"/"] || [titleRaw hasPrefix:@"$"]) {
+        titleRaw = [titleRaw substringFromIndex:1];
+    }
+    NSString *titleLower = titleRaw.lowercaseString;
+    NSString *detailLower = item.displayDetail.lowercaseString ?: @"";
+    NSString *keywordsLower = item.searchKeywords.lowercaseString ?: @"";
+    NSString *summaryLower = item.summary.lowercaseString ?: @"";
+
+    NSInteger lengthPenalty = (NSInteger)MIN((NSUInteger)40, baseLower.length);
+    NSInteger titlePenalty = (NSInteger)MIN((NSUInteger)36, titleLower.length);
+    if ([baseLower isEqualToString:q] || [stemLower isEqualToString:q] || [trimmedSlash isEqualToString:q] ||
+        (titleLower.length && [titleLower isEqualToString:q])) {
+        return 1000 - MIN(lengthPenalty, titlePenalty > 0 ? titlePenalty : lengthPenalty);
+    }
+    if (titleLower.length && [titleLower hasPrefix:q]) {
+        return 900 - titlePenalty;
+    }
+    if (baseLower.length && [baseLower hasPrefix:q]) {
+        return 880 - lengthPenalty;
+    }
+    if ([trimmedSlash hasPrefix:q]) {
+        return 840 - (NSInteger)MIN((NSUInteger)50, trimmedSlash.length);
+    }
+    if (titleLower.length && [titleLower containsString:q]) {
+        return 760 - titlePenalty;
+    }
+    NSString *acronym = IMIdentifierAcronym([baseRaw stringByDeletingPathExtension]);
+    if (acronym.length >= 2 && [acronym hasPrefix:q]) {
+        return 740 - lengthPenalty;
+    }
+    if (baseLower.length && [baseLower containsString:q]) {
+        return 620 - lengthPenalty;
+    }
+    if ([nameLower containsString:q]) {
+        return 500 - (NSInteger)MIN((NSUInteger)60, nameLower.length);
+    }
+    if (q.length >= 2 && ((baseLower.length && IMIsSubsequenceMatch(baseLower, q)) ||
+                          (titleLower.length && IMIsSubsequenceMatch(titleLower, q)))) {
+        return 380 - lengthPenalty;
+    }
+    if (q.length >= 2 && IMIsSubsequenceMatch(nameLower, q)) {
+        return 320 - (NSInteger)MIN((NSUInteger)60, nameLower.length);
+    }
+    if ((keywordsLower.length && [keywordsLower containsString:q]) ||
+        (detailLower.length && [detailLower containsString:q])) {
+        return 260;
+    }
+    if (summaryLower.length && [summaryLower containsString:q]) {
+        return 200;
+    }
+    return 0;
+}
+
 NSArray<InputMirrorSkillItem *> *InputMirrorFilterSkills(NSArray<InputMirrorSkillItem *> *skills,
                                                          NSString *query) {
     if (!skills.count) return @[];
     NSString *q = [[query ?: @"" stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
     if (!q.length) return skills;
 
-    NSMutableArray<InputMirrorSkillItem *> *prefixMatches = [NSMutableArray array];
-    NSMutableArray<InputMirrorSkillItem *> *containsMatches = [NSMutableArray array];
-    NSMutableArray<InputMirrorSkillItem *> *fuzzyMatches = [NSMutableArray array];
-    NSMutableArray<InputMirrorSkillItem *> *summaryMatches = [NSMutableArray array];
-
-    for (InputMirrorSkillItem *item in skills) {
-        NSString *nameLower = item.name.lowercaseString ?: @"";
-        NSString *baseLower = nameLower.lastPathComponent ?: @"";
-        NSString *summaryLower = item.summary.lowercaseString ?: @"";
-        if ([nameLower hasPrefix:q] || (baseLower.length && [baseLower hasPrefix:q])) {
-            [prefixMatches addObject:item];
-        } else if ([nameLower containsString:q]) {
-            [containsMatches addObject:item];
-        } else if (IMIsSubsequenceMatch(nameLower, q)) {
-            [fuzzyMatches addObject:item];
-        } else if ([summaryLower containsString:q]) {
-            [summaryMatches addObject:item];
+    NSMutableArray<NSDictionary *> *scored = [NSMutableArray arrayWithCapacity:skills.count];
+    for (NSUInteger idx = 0; idx < skills.count; idx++) {
+        InputMirrorSkillItem *item = skills[idx];
+        NSInteger score = IMScoreSkillItemForQuery(item, q);
+        if (score > 0) {
+            [scored addObject:@{ @"item": item, @"score": @(score), @"idx": @(idx) }];
         }
     }
+    [scored sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSInteger sa = [a[@"score"] integerValue];
+        NSInteger sb = [b[@"score"] integerValue];
+        if (sa != sb) return (sa > sb) ? NSOrderedAscending : NSOrderedDescending;
+        InputMirrorSkillItem *ia = a[@"item"];
+        InputMirrorSkillItem *ib = b[@"item"];
+        if (ia.recencyScore != ib.recencyScore) {
+            return (ia.recencyScore > ib.recencyScore) ? NSOrderedAscending : NSOrderedDescending;
+        }
+        return [a[@"idx"] compare:b[@"idx"]];
+    }];
 
-    NSMutableArray<InputMirrorSkillItem *> *combined = [NSMutableArray arrayWithCapacity:
-        prefixMatches.count + containsMatches.count + fuzzyMatches.count + summaryMatches.count];
-    [combined addObjectsFromArray:prefixMatches];
-    [combined addObjectsFromArray:containsMatches];
-    [combined addObjectsFromArray:fuzzyMatches];
-    [combined addObjectsFromArray:summaryMatches];
-    return combined;
+    NSMutableArray<InputMirrorSkillItem *> *result = [NSMutableArray arrayWithCapacity:scored.count];
+    for (NSDictionary *entry in scored) {
+        [result addObject:entry[@"item"]];
+    }
+    return result;
 }
 
-#pragma mark - Skill Popover Panel & Row Views
+#pragma mark - Skill Popover Panel, Category Pills & Row Views
 
 @interface InputMirrorSkillMenuPanel : NSPanel
 @end
@@ -1838,6 +2731,72 @@ NSArray<InputMirrorSkillItem *> *InputMirrorFilterSkills(NSArray<InputMirrorSkil
 @implementation InputMirrorSkillMenuPanel
 - (BOOL)canBecomeKeyWindow { return NO; }
 - (BOOL)canBecomeMainWindow { return NO; }
+@end
+
+@interface InputMirrorCategoryTabView : NSView
+@property(nonatomic, copy) NSString *categoryKey;
+@property(nonatomic, copy) NSString *titleText;
+@property(nonatomic) BOOL activeTab;
+@property(nonatomic) BOOL hovered;
+@property(nonatomic, strong) NSColor *accentColor;
+@property(nonatomic, strong) NSColor *mutedColor;
+@property(nonatomic, copy, nullable) void (^onSelect)(NSString *key);
+@property(nonatomic, strong, nullable) NSTrackingArea *hoverArea;
+@end
+
+@implementation InputMirrorCategoryTabView
+
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    if (self.hoverArea) [self removeTrackingArea:self.hoverArea];
+    self.hoverArea = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                                  options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                                    owner:self
+                                                 userInfo:nil];
+    [self addTrackingArea:self.hoverArea];
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    self.hovered = YES;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    self.hovered = NO;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)mouseDown:(NSEvent *)event {
+    if (self.onSelect && self.categoryKey.length) self.onSelect(self.categoryKey);
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    [super drawRect:dirtyRect];
+    NSRect pill = NSInsetRect(self.bounds, 1.0, 2.5);
+    NSColor *accent = self.accentColor ?: NSColor.controlAccentColor;
+    NSColor *muted = self.mutedColor ?: NSColor.secondaryLabelColor;
+    if (self.activeTab) {
+        [[accent colorWithAlphaComponent:0.16] setFill];
+        NSBezierPath *bp = [NSBezierPath bezierPathWithRoundedRect:pill xRadius:6.5 yRadius:6.5];
+        [bp fill];
+        [[accent colorWithAlphaComponent:0.38] setStroke];
+        bp.lineWidth = 0.85;
+        [bp stroke];
+    } else if (self.hovered) {
+        [[muted colorWithAlphaComponent:0.12] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:pill xRadius:6.5 yRadius:6.5] fill];
+    }
+    NSFont *font = [NSFont systemFontOfSize:11.5 weight:(self.activeTab ? NSFontWeightSemibold : NSFontWeightMedium)];
+    NSColor *fg = self.activeTab ? accent : muted;
+    NSDictionary *attrs = @{ NSFontAttributeName: font, NSForegroundColorAttributeName: fg };
+    NSSize sz = [(self.titleText ?: @"") sizeWithAttributes:attrs];
+    NSPoint pt = NSMakePoint(floor((NSWidth(self.bounds) - sz.width) * 0.5),
+                             floor((NSHeight(self.bounds) - sz.height) * 0.5));
+    [(self.titleText ?: @"") drawAtPoint:pt withAttributes:attrs];
+}
+
 @end
 
 @interface InputMirrorSkillRowView : NSView
@@ -2354,6 +3313,7 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
         if ([self handleSmartListIndent:hasShift]) return;
     }
     if (isDelete && !hasShift && !hasOtherMods && !self.hasMarkedText) {
+        if (self.onAtomicChipBackspace && self.onAtomicChipBackspace()) return;
         if ([self handleSmartListBackspace]) return;
     }
     if (isEscape && !self.hasMarkedText) {
@@ -2402,10 +3362,52 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
     }];
 }
 
+- (void)drawMentionChips {
+    NSTextStorage *storage = self.textStorage;
+    NSLayoutManager *lm = self.layoutManager;
+    NSTextContainer *tc = self.textContainer;
+    if (!storage.length || !lm || !tc) return;
+    [lm ensureLayoutForTextContainer:tc];
+    NSPoint origin = self.textContainerOrigin;
+
+    [storage enumerateAttribute:InputMirrorChipColorAttributeName
+                        inRange:NSMakeRange(0, storage.length)
+                        options:0
+                     usingBlock:^(id borderVal, NSRange charRange, BOOL *stop) {
+        if (![borderVal isKindOfClass:NSColor.class] || charRange.length == 0) return;
+        NSColor *borderColor = (NSColor *)borderVal;
+        NSColor *fillColor = [storage attribute:InputMirrorChipFillColorAttributeName atIndex:charRange.location effectiveRange:NULL];
+        if (![fillColor isKindOfClass:NSColor.class]) {
+            fillColor = [borderColor colorWithAlphaComponent:0.12];
+        }
+        NSRange glyphRange = [lm glyphRangeForCharacterRange:charRange actualCharacterRange:NULL];
+        if (glyphRange.length == 0) return;
+        [lm enumerateEnclosingRectsForGlyphRange:glyphRange
+                        withinSelectedGlyphRange:NSMakeRange(NSNotFound, 0)
+                                 inTextContainer:tc
+                                      usingBlock:^(NSRect rect, BOOL *innerStop) {
+            if (NSIsEmptyRect(rect)) return;
+            NSRect pill = NSMakeRect(origin.x + rect.origin.x - 2.0,
+                                     origin.y + rect.origin.y + 1.0,
+                                     rect.size.width + 4.0,
+                                     MAX(16.0, rect.size.height - 3.0));
+            if (!NSIntersectsRect(pill, self.visibleRect)) return;
+            NSBezierPath *bp = [NSBezierPath bezierPathWithRoundedRect:pill xRadius:5.0 yRadius:5.0];
+            [fillColor setFill];
+            [bp fill];
+            bp.lineWidth = 0.85;
+            [borderColor setStroke];
+            [bp stroke];
+        }];
+    }];
+}
+
 - (void)drawRect:(NSRect)dirtyRect {
     // Explicitly clear transparent backing pixels before drawing so deleted text never ghosts in non-opaque panels
     [[NSColor clearColor] setFill];
     NSRectFillUsingOperation(dirtyRect, NSCompositingOperationClear);
+    // Paint inline mention/skill/slash chips underneath text glyphs so typography stays Retina-crisp
+    [self drawMentionChips];
     [super drawRect:dirtyRect];
     [self drawVectorListBullets];
 
@@ -2468,6 +3470,7 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
 @property(nonatomic, copy) NSString *text;
 @property(nonatomic) NSRange selection;
 @property(nonatomic, copy) NSString *baseTargetText;
+@property(nonatomic, copy) NSSet<NSString *> *confirmedChips;
 @property(nonatomic) NSTimeInterval savedAt;
 @end
 
@@ -2499,6 +3502,8 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
 @property(nonatomic, assign) pid_t observedPID;
 @property(nonatomic, strong) NSMutableSet<NSNumber *> *manualAXPids;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, InputMirrorDraft *> *unsyncedDrafts;
+@property(nonatomic, strong) NSMutableSet<NSString *> *confirmedChipSet;
+@property(nonatomic, assign, readwrite) BOOL lastNativeHandoffAutoConfirmed;
 @property(nonatomic, strong) NSTimer *pollTimer;
 @property(nonatomic, strong) NSTimer *caretTimer;
 @property(nonatomic, strong) NSTimer *liveSyncTimer;
@@ -2520,6 +3525,8 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
 @property(nonatomic, strong) InputMirrorSkillMenuPanel *skillMenuPanel;
 @property(nonatomic, strong) PanelSurface *skillMenuCard;
 @property(nonatomic, strong) NSVisualEffectView *skillMenuGlass;
+@property(nonatomic, strong) NSView *skillMenuCategoryBar;
+@property(nonatomic, strong) NSView *skillMenuCategoryDivider;
 @property(nonatomic, strong) NSScrollView *skillMenuScroll;
 @property(nonatomic, strong) NSView *skillMenuListContainer;
 @property(nonatomic, strong) NSView *skillMenuFooterDivider;
@@ -2528,12 +3535,18 @@ static NSString *IMBuildListPrefix(IMParsedListLine *info, NSString *newIndent, 
 @property(nonatomic, strong) NSTextField *skillMenuFooterHint;
 @property(nonatomic, strong) NSArray<InputMirrorSkillItem *> *skillMenuItems;
 @property(nonatomic, strong) NSArray<InputMirrorSkillRowView *> *skillMenuRowViews;
+@property(nonatomic, strong) NSArray<InputMirrorCategoryTabView *> *skillMenuCategoryTabViews;
+@property(nonatomic, copy, readwrite) NSString *activeSkillMenuCategoryKey;
+@property(nonatomic, copy, readwrite) NSArray<NSString *> *availableSkillMenuCategories;
+@property(nonatomic, assign) unichar lastCategoryTriggerChar;
 @property(nonatomic, assign) NSInteger skillMenuSelectedIndex;
 @property(nonatomic, assign) InputMirrorSkillTrigger activeSkillTrigger;
 @property(nonatomic, assign) NSUInteger dismissedSkillTriggerLocation;
 @property(nonatomic, copy) NSArray<InputMirrorSkillItem *> *cachedSkills;
-@property(nonatomic, copy) NSString *cachedSkillsFamily;
+@property(nonatomic, copy) NSString *cachedSkillsCacheKey;
 @property(nonatomic, assign) NSTimeInterval cachedSkillsLoadedAt;
+@property(nonatomic, copy) NSArray<InputMirrorSkillItem *> *cachedSlashCommands;
+@property(nonatomic, copy) NSString *cachedSlashCommandsFamily;
 @property(nonatomic, copy) NSArray<InputMirrorSkillItem *> *cachedMentions;
 @property(nonatomic, copy) NSString *cachedMentionsCacheKey;
 @property(nonatomic, assign) NSTimeInterval cachedMentionsLoadedAt;
@@ -2565,8 +3578,12 @@ static void IMAxObserverCallback(AXObserverRef observer, AXUIElementRef element,
         _targetBundleID = @"";
         _manualAXPids = [NSMutableSet set];
         _unsyncedDrafts = [NSMutableDictionary dictionary];
+        _confirmedChipSet = [NSMutableSet set];
         _skillMenuItems = @[];
         _skillMenuRowViews = @[];
+        _skillMenuCategoryTabViews = @[];
+        _activeSkillMenuCategoryKey = @"all";
+        _availableSkillMenuCategories = @[@"all"];
         _dismissedSkillTriggerLocation = NSNotFound;
         [self buildPanel];
         [self buildSkillMenuPanel];
@@ -2596,6 +3613,10 @@ static void IMAxObserverCallback(AXObserverRef observer, AXUIElementRef element,
 
 - (BOOL)hasUnsyncedEdits {
     return self.hasLocalEditsPendingSync;
+}
+
+- (NSSet<NSString *> *)confirmedChipTokens {
+    return [self.confirmedChipSet copy] ?: [NSSet set];
 }
 
 #pragma mark - Unsynced Draft Protection
@@ -2631,6 +3652,7 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     draft.text = text;
     draft.selection = self.textView.selectedRange;
     draft.baseTargetText = base;
+    draft.confirmedChips = [self.confirmedChipSet copy];
     draft.savedAt = NSProcessInfo.processInfo.systemUptime;
     self.unsyncedDrafts[key] = draft;
 }
@@ -2922,6 +3944,9 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     tv.onSkillMenuKeyDown = ^BOOL(NSEvent *event) {
         return [weakSelf handleSkillMenuKeyDown:event];
     };
+    tv.onAtomicChipBackspace = ^BOOL{
+        return [weakSelf handleAtomicChipBackspace];
+    };
     tv.onNativeSlashHandoffShortcut = ^{
         [weakSelf handoffToNativeSlashMenu];
     };
@@ -2935,6 +3960,9 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
 
 - (void)updatePlaceholderVisibility {
     [self.textView setNeedsDisplay:YES];
+    if (self.panel.visible) {
+        [self refreshSkillMenuForCurrentText];
+    }
 }
 
 - (void)adjustHeightToFitContentAnimated:(BOOL)animated {
@@ -3290,8 +4318,16 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     self.targetBundleID = bundleID ?: @"";
     self.targetPID = pid;
     NSString *displayName = appName.length ? appName : @"输入中";
+    if ([self.targetBundleID.lowercaseString hasPrefix:@"com.openai.codex"] &&
+        [displayName.lowercaseString isEqualToString:@"chatgpt"]) {
+        displayName = @"Codex";
+    }
 
     if (draft != nil) {
+        [self.confirmedChipSet removeAllObjects];
+        if (draft.confirmedChips.count) {
+            [self.confirmedChipSet unionSet:draft.confirmedChips];
+        }
         [self updateMirroredText:draft.text
                        selection:draft.selection
                          appName:displayName
@@ -3309,6 +4345,9 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
         return NO;
     }
 
+    if (!sameTarget || safeText.length == 0) {
+        [self.confirmedChipSet removeAllObjects];
+    }
     [self updateMirroredText:safeText
                    selection:selection
                      appName:displayName
@@ -3616,14 +4655,26 @@ static const NSTimeInterval kMirrorDraftTTL = 7200.0;
     }
 }
 
-#pragma mark - Skill Autocomplete Popover & Native Slash Handoff
+#pragma mark - Skill Autocomplete Popover, Category Tabs, Atomic Chips & Native Segment Replay
 
+static const CGFloat kSkillMenuCategoryBarHeight = 32.0;
 static const CGFloat kSkillMenuRowHeight = 42.0;
-static const CGFloat kSkillMenuFooterHeight = 34.0;
+static const CGFloat kSkillMenuFooterHeight = 32.0;
 static const NSUInteger kSkillMenuMaxVisibleRows = 6;
 
+static NSString *IMCategoryDisplayName(NSString *categoryKey, NSString *family) {
+    if ([categoryKey isEqualToString:@"all"]) return @"全部";
+    if ([categoryKey isEqualToString:@"files"]) return @"文件";
+    if ([categoryKey isEqualToString:@"commands"]) return @"命令";
+    if ([categoryKey isEqualToString:@"skills"]) return [family isEqualToString:@"antigravity"] ? @"工作流·技能" : @"技能";
+    if ([categoryKey isEqualToString:@"chats"]) return @"对话";
+    if ([categoryKey isEqualToString:@"mcp"]) return [family isEqualToString:@"codex"] ? @"MCP·智能体" : @"规则·MCP";
+    if ([categoryKey isEqualToString:@"context"]) return @"上下文";
+    return categoryKey ?: @"其他";
+}
+
 - (void)buildSkillMenuPanel {
-    NSRect frame = NSMakeRect(0, 0, 440.0, 200.0);
+    NSRect frame = NSMakeRect(0, 0, 460.0, 220.0);
     InputMirrorSkillMenuPanel *sp = [[InputMirrorSkillMenuPanel alloc] initWithContentRect:frame
                                                                                  styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
                                                                                    backing:NSBackingStoreBuffered
@@ -3653,7 +4704,18 @@ static const NSUInteger kSkillMenuMaxVisibleRows = 6;
     [card addSubview:glass];
     self.skillMenuGlass = glass;
 
-    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, kSkillMenuFooterHeight + 1.0, NSWidth(frame), NSHeight(frame) - kSkillMenuFooterHeight - 1.0)];
+    NSView *catBar = [[NSView alloc] initWithFrame:NSMakeRect(0, NSHeight(frame) - kSkillMenuCategoryBarHeight, NSWidth(frame), kSkillMenuCategoryBarHeight)];
+    catBar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [card addSubview:catBar];
+    self.skillMenuCategoryBar = catBar;
+
+    NSView *catDiv = [[NSView alloc] initWithFrame:NSMakeRect(10.0, NSHeight(frame) - kSkillMenuCategoryBarHeight - 1.0, NSWidth(frame) - 20.0, 1.0)];
+    catDiv.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    catDiv.wantsLayer = YES;
+    [card addSubview:catDiv];
+    self.skillMenuCategoryDivider = catDiv;
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, kSkillMenuFooterHeight + 1.0, NSWidth(frame), NSHeight(frame) - kSkillMenuFooterHeight - kSkillMenuCategoryBarHeight - 2.0)];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     scroll.hasVerticalScroller = YES;
     scroll.hasHorizontalScroller = NO;
@@ -3686,17 +4748,17 @@ static const NSUInteger kSkillMenuMaxVisibleRows = 6;
     self.skillMenuFooterRow = footerRow;
 
     NSTextField *footerTitle = [NSTextField labelWithString:@"在原应用原生菜单中打开…"];
-    footerTitle.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    footerTitle.font = [NSFont systemFontOfSize:11.5 weight:NSFontWeightMedium];
     footerTitle.lineBreakMode = NSLineBreakByTruncatingTail;
-    footerTitle.frame = NSMakeRect(14.0, 8.0, NSWidth(frame) - 96.0, 18.0);
+    footerTitle.frame = NSMakeRect(14.0, 7.0, NSWidth(frame) - 168.0, 18.0);
     footerTitle.autoresizingMask = NSViewWidthSizable;
     [footerRow addSubview:footerTitle];
     self.skillMenuFooterTitle = footerTitle;
 
-    NSTextField *footerHint = [NSTextField labelWithString:@"⌘/"];
-    footerHint.font = [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightMedium];
+    NSTextField *footerHint = [NSTextField labelWithString:@"↵ 确认 · ⇧Tab 分类"];
+    footerHint.font = [NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightMedium];
     footerHint.alignment = NSTextAlignmentRight;
-    footerHint.frame = NSMakeRect(NSWidth(frame) - 74.0, 8.0, 60.0, 18.0);
+    footerHint.frame = NSMakeRect(NSWidth(frame) - 152.0, 7.0, 138.0, 18.0);
     footerHint.autoresizingMask = NSViewMinXMargin;
     [footerRow addSubview:footerHint];
     self.skillMenuFooterHint = footerHint;
@@ -3735,10 +4797,16 @@ static const NSUInteger kSkillMenuMaxVisibleRows = 6;
     }
     NSColor *accent = [self currentAccentColor];
     NSColor *muted = (self.style == InputMirrorStyleGlass) ? NSColor.secondaryLabelColor : [self currentMutedColor];
+    self.skillMenuCategoryDivider.layer.backgroundColor = [muted colorWithAlphaComponent:0.18].CGColor;
     self.skillMenuFooterDivider.layer.backgroundColor = [muted colorWithAlphaComponent:0.22].CGColor;
     self.skillMenuFooterTitle.textColor = [self currentTextColor];
     self.skillMenuFooterHint.textColor = muted;
     self.skillMenuFooterRow.selectionColor = [accent colorWithAlphaComponent:0.16];
+    for (InputMirrorCategoryTabView *tab in self.skillMenuCategoryTabViews) {
+        tab.accentColor = accent;
+        tab.mutedColor = muted;
+        [tab setNeedsDisplay:YES];
+    }
     for (InputMirrorSkillRowView *row in self.skillMenuRowViews) {
         row.selectionColor = [accent colorWithAlphaComponent:0.16];
         [row setNeedsDisplay:YES];
@@ -3746,20 +4814,59 @@ static const NSUInteger kSkillMenuMaxVisibleRows = 6;
     [self.skillMenuCard setNeedsDisplay:YES];
 }
 
+- (NSArray<InputMirrorSkillItem *> *)slashCommandsForActiveApp {
+    if (self.overrideSlashCommandsForTesting != nil) {
+        return self.overrideSlashCommandsForTesting;
+    }
+    NSString *family = IMSkillAppFamilyKey(self.targetBundleID, self.targetAppName);
+    if (self.cachedSlashCommands && [self.cachedSlashCommandsFamily isEqualToString:family]) {
+        return self.cachedSlashCommands;
+    }
+    NSArray<InputMirrorSkillItem *> *loaded = InputMirrorLoadSlashCommandsForApp(self.targetBundleID, self.targetAppName);
+    self.cachedSlashCommands = loaded;
+    self.cachedSlashCommandsFamily = family;
+    return loaded;
+}
+
 - (NSArray<InputMirrorSkillItem *> *)skillsForActiveApp {
     if (self.overrideSkillsForTesting != nil) {
         return self.overrideSkillsForTesting;
     }
     NSString *family = IMSkillAppFamilyKey(self.targetBundleID, self.targetAppName);
+    NSString *workspaceRoot = [self resolveActiveWorkspaceRoot] ?: @"";
+    NSString *cacheKey = [NSString stringWithFormat:@"%@|%@", family, workspaceRoot];
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    if (self.cachedSkills && [self.cachedSkillsFamily isEqualToString:family] && (now - self.cachedSkillsLoadedAt) < 15.0) {
+    if (self.cachedSkills && [self.cachedSkillsCacheKey isEqualToString:cacheKey] && (now - self.cachedSkillsLoadedAt) < 15.0) {
         return self.cachedSkills;
     }
-    NSArray<InputMirrorSkillItem *> *loaded = InputMirrorLoadSkillsForApp(self.targetBundleID, self.targetAppName, nil);
+    NSArray<InputMirrorSkillItem *> *loaded = InputMirrorLoadSkillsForAppInWorkspace(self.targetBundleID, self.targetAppName, workspaceRoot, nil);
     self.cachedSkills = loaded;
-    self.cachedSkillsFamily = family;
+    self.cachedSkillsCacheKey = cacheKey;
     self.cachedSkillsLoadedAt = now;
     return loaded;
+}
+
+- (NSArray<InputMirrorSkillItem *> *)slashAndSkillCandidatesForActiveApp {
+    if (self.overrideSkillsForTesting != nil && self.overrideSlashCommandsForTesting == nil) {
+        return self.overrideSkillsForTesting;
+    }
+    NSArray<InputMirrorSkillItem *> *cmds = [self slashCommandsForActiveApp];
+    NSArray<InputMirrorSkillItem *> *skills = [self skillsForActiveApp];
+    if (!cmds.count) return skills;
+    if (!skills.count) return cmds;
+    NSMutableArray<InputMirrorSkillItem *> *merged = [NSMutableArray arrayWithCapacity:cmds.count + skills.count];
+    NSMutableSet<NSString *> *seenCmds = [NSMutableSet set];
+    for (InputMirrorSkillItem *c in cmds) {
+        [merged addObject:c];
+        if (c.name.length) [seenCmds addObject:[NSString stringWithFormat:@"%@%@", c.insertPrefix ?: @"/", c.name.lowercaseString]];
+    }
+    for (InputMirrorSkillItem *s in skills) {
+        NSString *key = [NSString stringWithFormat:@"%@%@", s.insertPrefix ?: @"/", s.name.lowercaseString ?: @""];
+        if (![seenCmds containsObject:key]) {
+            [merged addObject:s];
+        }
+    }
+    return merged;
 }
 
 static NSString *IMFindProjectRootFromPath(NSString *path) {
@@ -3821,6 +4928,18 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
                             if (root.length) return root;
                         }
                     }
+                    NSString *family = IMSkillAppFamilyKey(self.targetBundleID, self.targetAppName);
+                    if ([family isEqualToString:@"codex"]) {
+                        NSString *cleanWinTitle = [title stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                        if (cleanWinTitle.length >= 2 &&
+                            ![cleanWinTitle.lowercaseString isEqualToString:@"codex"] &&
+                            ![cleanWinTitle.lowercaseString isEqualToString:@"chatgpt"]) {
+                            NSString *codexDB = [NSHomeDirectory() stringByAppendingPathComponent:@".codex/state_5.sqlite"];
+                            NSString *matchedCwd = IMQueryBoundSQLiteText(codexDB, "SELECT cwd FROM threads WHERE (name = ?1 OR title = ?1) AND cwd IS NOT NULL AND cwd != '' ORDER BY updated_at DESC LIMIT 1;", cleanWinTitle);
+                            NSString *dir = IMExistingDirectoryPathFromURIOrPath(matchedCwd);
+                            if (dir.length) return dir;
+                        }
+                    }
                 }
             }
         }
@@ -3839,33 +4958,46 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     if (self.cachedMentions && [self.cachedMentionsCacheKey isEqualToString:cacheKey] && (now - self.cachedMentionsLoadedAt) < 15.0) {
         return self.cachedMentions;
     }
+
     NSArray<InputMirrorSkillItem *> *baseMentions = InputMirrorLoadMentionsForApp(self.targetBundleID, self.targetAppName, workspaceRoot);
     NSArray<InputMirrorSkillItem *> *convMentions = InputMirrorLoadConversationMentionsForApp(self.targetBundleID, self.targetAppName, nil);
-    NSMutableArray<InputMirrorSkillItem *> *merged = [NSMutableArray arrayWithCapacity:baseMentions.count + convMentions.count];
+    NSArray<InputMirrorSkillItem *> *codexSkills = [family isEqualToString:@"codex"] ? [self skillsForActiveApp] : @[];
+
+    NSMutableArray<InputMirrorSkillItem *> *merged = [NSMutableArray arrayWithCapacity:baseMentions.count + convMentions.count + codexSkills.count];
     NSMutableSet<NSString *> *seen = [NSMutableSet set];
 
-    // 1. Built-in app @ mentions (context/agents/participants)
+    // 1. Workspace files & directories FIRST (aligned with Codex & Antigravity '@' behavior!)
     for (InputMirrorSkillItem *item in baseMentions) {
-        if ([item.sourceLabel isEqualToString:@"文件"] || [item.sourceLabel isEqualToString:@"目录"]) continue;
-        NSString *key = item.name.lowercaseString ?: @"";
-        if (key.length && ![seen containsObject:key]) {
+        if (!(item.itemKind == InputMirrorItemKindFile || item.itemKind == InputMirrorItemKindFolder ||
+              [item.sourceLabel isEqualToString:@"文件"] || [item.sourceLabel isEqualToString:@"目录"])) continue;
+        NSString *key = [NSString stringWithFormat:@"file:%@", item.name.lowercaseString ?: @""];
+        if (![seen containsObject:key]) {
             [seen addObject:key];
             [merged addObject:item];
         }
     }
-    // 2. Recent conversations for this app (so typing @ immediately surfaces conversations)
+    // 2. Built-in context / MCP / Rules / Agents
+    for (InputMirrorSkillItem *item in baseMentions) {
+        if (item.itemKind == InputMirrorItemKindFile || item.itemKind == InputMirrorItemKindFolder ||
+            [item.sourceLabel isEqualToString:@"文件"] || [item.sourceLabel isEqualToString:@"目录"]) continue;
+        NSString *key = [NSString stringWithFormat:@"ctx:%@", item.name.lowercaseString ?: @""];
+        if (![seen containsObject:key]) {
+            [seen addObject:key];
+            [merged addObject:item];
+        }
+    }
+    // 3. Codex '@' also searches Skills (inserting $skill chip just like Codex's native composer.atMentionList.skills)
+    for (InputMirrorSkillItem *sk in codexSkills) {
+        NSString *key = [NSString stringWithFormat:@"skill:%@", sk.name.lowercaseString ?: @""];
+        if (![seen containsObject:key]) {
+            [seen addObject:key];
+            [merged addObject:sk];
+        }
+    }
+    // 4. Clean conversation / thread mentions
     for (InputMirrorSkillItem *item in convMentions) {
-        NSString *key = item.name.lowercaseString ?: @"";
-        if (key.length && ![seen containsObject:key]) {
-            [seen addObject:key];
-            [merged addObject:item];
-        }
-    }
-    // 3. Workspace directories and files
-    for (InputMirrorSkillItem *item in baseMentions) {
-        if (!([item.sourceLabel isEqualToString:@"文件"] || [item.sourceLabel isEqualToString:@"目录"])) continue;
-        NSString *key = item.name.lowercaseString ?: @"";
-        if (key.length && ![seen containsObject:key]) {
+        NSString *key = [NSString stringWithFormat:@"chat:%@", item.name.lowercaseString ?: @""];
+        if (![seen containsObject:key]) {
             [seen addObject:key];
             [merged addObject:item];
         }
@@ -3875,6 +5007,86 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     self.cachedMentionsCacheKey = cacheKey;
     self.cachedMentionsLoadedAt = now;
     return merged;
+}
+
+- (NSArray<NSString *> *)categoriesForCandidates:(NSArray<InputMirrorSkillItem *> *)candidates triggerChar:(unichar)triggerChar {
+    if (triggerChar == '$') return @[@"all"];
+    NSMutableOrderedSet<NSString *> *present = [NSMutableOrderedSet orderedSet];
+    for (InputMirrorSkillItem *item in candidates) {
+        NSString *cat = item.categoryKey.length ? item.categoryKey : @"skills";
+        [present addObject:cat];
+    }
+    if (present.count <= 1) return @[@"all"];
+    NSArray<NSString *> *preferredOrder = (triggerChar == '@')
+        ? @[@"files", @"skills", @"chats", @"mcp", @"context"]
+        : @[@"commands", @"skills"];
+    NSMutableArray<NSString *> *ordered = [NSMutableArray arrayWithObject:@"all"];
+    for (NSString *k in preferredOrder) {
+        if ([present containsObject:k]) [ordered addObject:k];
+    }
+    for (NSString *k in present) {
+        if (![ordered containsObject:k]) [ordered addObject:k];
+    }
+    return ordered;
+}
+
+- (NSArray<InputMirrorSkillItem *> *)curateItems:(NSArray<InputMirrorSkillItem *> *)candidates
+                                     forCategory:(NSString *)categoryKey
+                                           query:(NSString *)query
+                                     triggerChar:(unichar)triggerChar {
+    NSString *cat = categoryKey.length ? categoryKey : @"all";
+    NSArray<InputMirrorSkillItem *> *scoped = candidates;
+    if (![cat isEqualToString:@"all"]) {
+        NSMutableArray<InputMirrorSkillItem *> *sub = [NSMutableArray array];
+        for (InputMirrorSkillItem *it in candidates) {
+            NSString *itCat = it.categoryKey.length ? it.categoryKey : @"skills";
+            if ([itCat isEqualToString:cat]) [sub addObject:it];
+        }
+        scoped = sub;
+    }
+
+    NSString *trimmedQuery = [query ?: @"" stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (trimmedQuery.length > 0 || ![cat isEqualToString:@"all"]) {
+        return InputMirrorFilterSkills(scoped, trimmedQuery);
+    }
+
+    // Empty '@' query in 'all' tab: balanced Codex/Antigravity overview (top recent files first, then concise slices of context/MCP, skills & chats)
+    if (triggerChar == '@' && self.overrideMentionsForTesting == nil) {
+        NSMutableArray<InputMirrorSkillItem *> *curated = [NSMutableArray array];
+        NSUInteger fileCap = 12, ctxCap = 4, skillCap = 4, chatCap = 4;
+        for (InputMirrorSkillItem *it in scoped) {
+            NSString *c = it.categoryKey ?: @"";
+            if ([c isEqualToString:@"files"]) {
+                if (fileCap > 0) { [curated addObject:it]; fileCap--; }
+            } else if ([c isEqualToString:@"mcp"] || [c isEqualToString:@"context"]) {
+                if (ctxCap > 0) { [curated addObject:it]; ctxCap--; }
+            } else if ([c isEqualToString:@"skills"]) {
+                if (skillCap > 0) { [curated addObject:it]; skillCap--; }
+            } else if ([c isEqualToString:@"chats"]) {
+                if (chatCap > 0) { [curated addObject:it]; chatCap--; }
+            } else {
+                [curated addObject:it];
+            }
+        }
+        return curated.count ? curated : scoped;
+    }
+    return scoped;
+}
+
+- (void)selectSkillMenuCategory:(NSString *)categoryKey {
+    if (!categoryKey.length || ![self.availableSkillMenuCategories containsObject:categoryKey]) return;
+    self.activeSkillMenuCategoryKey = categoryKey;
+    [self refreshSkillMenuForCurrentText];
+}
+
+- (void)cycleSkillMenuCategoryByDelta:(NSInteger)delta {
+    NSArray<NSString *> *cats = self.availableSkillMenuCategories;
+    if (cats.count <= 1) return;
+    NSUInteger cur = [cats indexOfObject:self.activeSkillMenuCategoryKey ?: @"all"];
+    if (cur == NSNotFound) cur = 0;
+    NSInteger count = (NSInteger)cats.count;
+    NSInteger next = (((NSInteger)cur + delta) % count + count) % count;
+    [self selectSkillMenuCategory:cats[(NSUInteger)next]];
 }
 
 - (void)hideSkillMenu {
@@ -3887,21 +5099,40 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     self.activeSkillTrigger = (InputMirrorSkillTrigger){ NO, NSMakeRange(NSNotFound, 0), 0 };
 }
 
+- (CGFloat)preferredPopoverAnchorScreenX {
+    NSRect parentFrame = self.panel.frame;
+    if (!self.activeSkillTrigger.active || !self.textView.layoutManager || !self.textView.textContainer) {
+        return NSMinX(parentFrame);
+    }
+    NSUInteger charIdx = MIN(self.activeSkillTrigger.tokenRange.location, self.textView.string.length);
+    if (charIdx >= self.textView.string.length) return NSMinX(parentFrame);
+    [self.textView.layoutManager ensureLayoutForTextContainer:self.textView.textContainer];
+    NSUInteger glyphIdx = [self.textView.layoutManager glyphIndexForCharacterAtIndex:charIdx];
+    NSRect glyphRect = [self.textView.layoutManager boundingRectForGlyphRange:NSMakeRange(glyphIdx, 1) inTextContainer:self.textView.textContainer];
+    NSPoint viewPt = NSMakePoint(self.textView.textContainerOrigin.x + glyphRect.origin.x - 10.0,
+                                 self.textView.textContainerOrigin.y + glyphRect.origin.y);
+    NSPoint winPt = [self.textView convertPoint:viewPt toView:nil];
+    NSRect screenRect = [self.panel convertRectToScreen:NSMakeRect(winPt.x, winPt.y, 1.0, 1.0)];
+    return MAX(NSMinX(parentFrame), screenRect.origin.x);
+}
+
 - (void)repositionSkillMenuPanel {
     if (!self.panel || !self.skillMenuPanel) return;
+    BOOL showCatBar = (self.availableSkillMenuCategories.count > 1);
+    CGFloat catBarTotal = showCatBar ? (kSkillMenuCategoryBarHeight + 1.0) : 0.0;
     NSUInteger skillCount = self.skillMenuItems.count > 0 ? (self.skillMenuItems.count - 1) : 0;
     NSUInteger visibleRows = MIN(skillCount, kSkillMenuMaxVisibleRows);
     CGFloat listHeight = (visibleRows > 0) ? (visibleRows * kSkillMenuRowHeight + 8.0) : 0.0;
-    CGFloat totalHeight = listHeight + (listHeight > 0 ? 1.0 : 0.0) + kSkillMenuFooterHeight;
+    CGFloat totalHeight = catBarTotal + listHeight + (listHeight > 0 ? 1.0 : 0.0) + kSkillMenuFooterHeight;
 
     NSRect parentFrame = self.panel.frame;
-    CGFloat width = MIN(MAX(NSWidth(parentFrame), 340.0), 560.0);
+    CGFloat width = MIN(MAX(NSWidth(parentFrame) * 0.86, 390.0), 540.0);
     NSScreen *screen = self.panel.screen ?: NSScreen.mainScreen;
     NSRect visible = screen ? screen.visibleFrame : NSMakeRect(0, 0, 1440, 900);
 
-    CGFloat x = NSMinX(parentFrame);
-    if (x + width > NSMaxX(visible)) x = MAX(NSMinX(visible), NSMaxX(visible) - width);
-    if (x < NSMinX(visible)) x = NSMinX(visible);
+    CGFloat x = [self preferredPopoverAnchorScreenX];
+    if (x + width > NSMaxX(visible) - 8.0) x = MAX(NSMinX(visible) + 8.0, NSMaxX(visible) - 8.0 - width);
+    if (x < NSMinX(visible) + 8.0) x = NSMinX(visible) + 8.0;
 
     CGFloat gap = 6.0;
     CGFloat belowY = NSMinY(parentFrame) - gap - totalHeight;
@@ -3914,6 +5145,12 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     }
 
     [self.skillMenuPanel setFrame:NSMakeRect(x, y, width, totalHeight) display:YES];
+    self.skillMenuCategoryBar.hidden = !showCatBar;
+    self.skillMenuCategoryDivider.hidden = !showCatBar;
+    if (showCatBar) {
+        self.skillMenuCategoryBar.frame = NSMakeRect(0, totalHeight - kSkillMenuCategoryBarHeight, width, kSkillMenuCategoryBarHeight);
+        self.skillMenuCategoryDivider.frame = NSMakeRect(10.0, totalHeight - kSkillMenuCategoryBarHeight - 1.0, width - 20.0, 1.0);
+    }
     self.skillMenuScroll.hidden = (skillCount == 0);
     self.skillMenuFooterDivider.hidden = (skillCount == 0);
     if (skillCount > 0) {
@@ -3923,21 +5160,59 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     self.skillMenuFooterRow.frame = NSMakeRect(0, 0, width, kSkillMenuFooterHeight);
 }
 
+- (void)rebuildCategoryTabViewsWithFamily:(NSString *)family {
+    for (NSView *sub in [self.skillMenuCategoryBar.subviews copy]) {
+        [sub removeFromSuperview];
+    }
+    NSArray<NSString *> *cats = self.availableSkillMenuCategories;
+    if (cats.count <= 1) {
+        self.skillMenuCategoryTabViews = @[];
+        return;
+    }
+    NSColor *accent = [self currentAccentColor];
+    NSColor *muted = (self.style == InputMirrorStyleGlass) ? NSColor.secondaryLabelColor : [self currentMutedColor];
+    NSFont *measureFont = [NSFont systemFontOfSize:11.5 weight:NSFontWeightSemibold];
+    NSDictionary *measureAttrs = @{ NSFontAttributeName: measureFont };
+
+    NSMutableArray<InputMirrorCategoryTabView *> *tabs = [NSMutableArray arrayWithCapacity:cats.count];
+    __weak InputMirrorController *weakSelf = self;
+    CGFloat x = 10.0;
+    for (NSString *key in cats) {
+        NSString *label = IMCategoryDisplayName(key, family);
+        CGFloat w = ceil([label sizeWithAttributes:measureAttrs].width) + 20.0;
+        InputMirrorCategoryTabView *tab = [[InputMirrorCategoryTabView alloc] initWithFrame:NSMakeRect(x, 3.0, w, kSkillMenuCategoryBarHeight - 6.0)];
+        tab.categoryKey = key;
+        tab.titleText = label;
+        tab.activeTab = [key isEqualToString:(self.activeSkillMenuCategoryKey ?: @"all")];
+        tab.accentColor = accent;
+        tab.mutedColor = muted;
+        tab.onSelect = ^(NSString *selectedKey) {
+            [weakSelf selectSkillMenuCategory:selectedKey];
+        };
+        [self.skillMenuCategoryBar addSubview:tab];
+        [tabs addObject:tab];
+        x += w + 4.0;
+    }
+    self.skillMenuCategoryTabViews = tabs;
+}
+
 - (void)rebuildSkillMenuRowsWithFilteredSkills:(NSArray<InputMirrorSkillItem *> *)filtered query:(NSString *)query triggerChar:(unichar)triggerChar {
+    NSString *family = IMSkillAppFamilyKey(self.targetBundleID, self.targetAppName);
+    [self rebuildCategoryTabViewsWithFamily:family];
+
     NSString *appDisplay = self.targetAppName.length ? self.targetAppName : @"原应用";
     BOOL isMention = (triggerChar == '@');
     InputMirrorSkillItem *handoffItem = [[InputMirrorSkillItem alloc] init];
     handoffItem.isNativeHandoffAction = YES;
+    handoffItem.itemKind = InputMirrorItemKindNativeHandoff;
     if (isMention) {
-        if (query.length > 0) {
-            handoffItem.name = [NSString stringWithFormat:@"在 %@ 原生 @ 菜单中打开「@%@」…", appDisplay, query];
-        } else {
-            handoffItem.name = [NSString stringWithFormat:@"在 %@ 原生 @ 菜单中打开「@」…", appDisplay];
-        }
-    } else if (query.length > 0) {
-        handoffItem.name = [NSString stringWithFormat:@"在 %@ 原生菜单中打开「%C%@」…", appDisplay, triggerChar, query];
+        handoffItem.name = query.length > 0
+            ? [NSString stringWithFormat:@"在 %@ 原生 @ 菜单打开「@%@」…", appDisplay, query]
+            : [NSString stringWithFormat:@"在 %@ 原生 @ 菜单浏览全部…", appDisplay];
     } else {
-        handoffItem.name = [NSString stringWithFormat:@"在 %@ 原生菜单中打开「%C」…", appDisplay, triggerChar];
+        handoffItem.name = query.length > 0
+            ? [NSString stringWithFormat:@"在 %@ 原生菜单运行「%C%@」…", appDisplay, triggerChar, query]
+            : [NSString stringWithFormat:@"在 %@ 原生菜单浏览全部…", appDisplay];
     }
 
     NSMutableArray<InputMirrorSkillItem *> *allItems = [NSMutableArray arrayWithArray:filtered];
@@ -3945,7 +5220,9 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     self.skillMenuItems = allItems;
 
     self.skillMenuFooterTitle.stringValue = handoffItem.name;
-    self.skillMenuFooterHint.stringValue = isMention ? @"⇧⌘2" : @"⌘/";
+    self.skillMenuFooterHint.stringValue = (self.availableSkillMenuCategories.count > 1)
+        ? @"↵/Tab 确认 · ⇧Tab 分类"
+        : (isMention ? @"↵/Tab 确认 · ⇧⌘2 原生" : @"↵/Tab 确认 · ⌘/ 原生");
     self.skillMenuFooterRow.rowIndex = (NSInteger)filtered.count;
 
     for (NSView *sub in [self.skillMenuListContainer.subviews copy]) {
@@ -3953,7 +5230,7 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     }
 
     NSRect parentFrame = self.panel.frame;
-    CGFloat width = MIN(MAX(NSWidth(parentFrame), 340.0), 560.0);
+    CGFloat width = MIN(MAX(NSWidth(parentFrame) * 0.86, 390.0), 540.0);
     CGFloat contentH = filtered.count * kSkillMenuRowHeight + 8.0;
     self.skillMenuListContainer.frame = NSMakeRect(0, 0, width, MAX(contentH, 1.0));
 
@@ -3967,7 +5244,6 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
 
     for (NSUInteger i = 0; i < filtered.count; i++) {
         InputMirrorSkillItem *item = filtered[i];
-        // Flip top-to-bottom inside non-flipped NSView
         CGFloat rowY = contentH - 4.0 - (i + 1) * kSkillMenuRowHeight;
         InputMirrorSkillRowView *row = [[InputMirrorSkillRowView alloc] initWithFrame:NSMakeRect(0, rowY, width, kSkillMenuRowHeight)];
         row.autoresizingMask = NSViewWidthSizable;
@@ -3980,32 +5256,58 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
             [weakSelf confirmSkillMenuItemAtIndex:idx];
         };
 
+        // SF Symbol icon matching item kind (file, folder, command, skill, conversation, MCP)
+        NSString *symName = item.symbolName.length ? item.symbolName : (isMention ? @"doc.text" : @"sparkles");
+        NSImage *symImg = [NSImage imageWithSystemSymbolName:symName accessibilityDescription:nil];
+        if (symImg) {
+            NSImageSymbolConfiguration *cfg = [NSImageSymbolConfiguration configurationWithPointSize:13.0 weight:NSFontWeightMedium];
+            NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(13.0, 12.0, 18.0, 18.0)];
+            iconView.image = [symImg imageWithSymbolConfiguration:cfg] ?: symImg;
+            iconView.contentTintColor = (item.itemKind == InputMirrorItemKindFile || item.itemKind == InputMirrorItemKindFolder) ? muted : accent;
+            [row addSubview:iconView];
+        }
+
         NSString *prefix = item.insertPrefix.length ? item.insertPrefix : (isMention ? @"@" : @"/");
-        NSTextField *nameLabel = [NSTextField labelWithString:[NSString stringWithFormat:@"%@%@", prefix, item.name]];
-        nameLabel.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold];
-        nameLabel.textColor = accent;
+        NSString *primaryTitle = item.displayTitle.length ? item.displayTitle : [NSString stringWithFormat:@"%@%@", prefix, item.name];
+        NSMutableAttributedString *titleAttr = [[NSMutableAttributedString alloc] initWithString:primaryTitle attributes:@{
+            NSFontAttributeName: [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold],
+            NSForegroundColorAttributeName: (item.itemKind == InputMirrorItemKindFile || item.itemKind == InputMirrorItemKindConversation) ? textColor : accent
+        }];
+        if (item.displayDetail.length > 0) {
+            NSAttributedString *detailAttr = [[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"  %@", item.displayDetail] attributes:@{
+                NSFontAttributeName: [NSFont systemFontOfSize:11.5 weight:NSFontWeightRegular],
+                NSForegroundColorAttributeName: muted
+            }];
+            [titleAttr appendAttributedString:detailAttr];
+        }
+
+        NSTextField *nameLabel = [NSTextField labelWithAttributedString:titleAttr];
         nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        nameLabel.frame = NSMakeRect(14.0, 21.0, width - 92.0, 17.0);
+        nameLabel.frame = NSMakeRect(36.0, 21.0, width - 118.0, 17.0);
         nameLabel.autoresizingMask = NSViewWidthSizable;
         [row addSubview:nameLabel];
 
-        if (item.sourceLabel.length > 0) {
-            NSTextField *badge = [NSTextField labelWithString:item.sourceLabel];
+        NSString *badgeText = item.sourceLabel ?: @"";
+        if (item.autoConfirmOnNativeHandoff && [badgeText isEqualToString:@"命令"]) {
+            badgeText = @"命令 ↵";
+        }
+        if (badgeText.length > 0) {
+            NSTextField *badge = [NSTextField labelWithString:badgeText];
             badge.font = [NSFont systemFontOfSize:10.5 weight:NSFontWeightMedium];
             badge.textColor = muted;
             badge.alignment = NSTextAlignmentRight;
-            badge.frame = NSMakeRect(width - 78.0, 22.0, 64.0, 15.0);
+            badge.frame = NSMakeRect(width - 80.0, 22.0, 66.0, 15.0);
             badge.autoresizingMask = NSViewMinXMargin;
             [row addSubview:badge];
         }
 
-        NSString *fallbackDesc = isMention ? @"点击或按 Enter 插入 @ 引用" : @"点击或按 Enter 插入技能";
+        NSString *fallbackDesc = isMention ? @"回车或 Tab 插入引用标签" : @"回车或 Tab 确认";
         NSString *desc = item.summary.length ? item.summary : fallbackDesc;
         NSTextField *descLabel = [NSTextField labelWithString:desc];
-        descLabel.font = [NSFont systemFontOfSize:11.5 weight:NSFontWeightRegular];
-        descLabel.textColor = [textColor colorWithAlphaComponent:0.72];
+        descLabel.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
+        descLabel.textColor = [textColor colorWithAlphaComponent:0.66];
         descLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        descLabel.frame = NSMakeRect(14.0, 5.0, width - 28.0, 15.0);
+        descLabel.frame = NSMakeRect(36.0, 4.0, width - 50.0, 15.0);
         descLabel.autoresizingMask = NSViewWidthSizable;
         [row addSubview:descLabel];
 
@@ -4017,7 +5319,6 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     self.skillMenuRowViews = rowViews;
 
     [self repositionSkillMenuPanel];
-    // Scroll to top of list (highest y in non-flipped coordinates)
     if (filtered.count > 0) {
         CGFloat topY = MAX(0.0, NSHeight(self.skillMenuListContainer.frame) - NSHeight(self.skillMenuScroll.contentView.bounds));
         [self.skillMenuScroll.contentView scrollToPoint:NSMakePoint(0, topY)];
@@ -4041,16 +5342,44 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
 }
 
 - (void)refreshSkillMenuForCurrentText {
-    if (self.textView.hasMarkedText || !self.panel.visible) {
+    if (!self.panel.visible) {
         [self hideSkillMenu];
         return;
     }
-    NSString *text = self.textView.string ?: @"";
+    NSString *rawText = self.textView.string ?: @"";
     NSRange sel = self.textView.selectedRange;
+    NSString *parseText = rawText;
+    NSRange parseSel = sel;
+    NSString *imeRawLatin = @"";
+
+    // Keep the @ / / / $ popover smoothly open during Chinese Pinyin IME composition instead of flashing closed!
+    if (self.textView.hasMarkedText) {
+        NSRange marked = self.textView.markedRange;
+        if (marked.location != NSNotFound && NSMaxRange(marked) <= rawText.length) {
+            NSString *markedStr = [rawText substringWithRange:marked];
+            NSMutableString *compact = [NSMutableString stringWithCapacity:markedStr.length];
+            for (NSUInteger i = 0; i < markedStr.length; i++) {
+                unichar c = [markedStr characterAtIndex:i];
+                if (!IMIsTriggerBoundaryChar(c) && c != '\'' && c != 0x2019) {
+                    [compact appendFormat:@"%C", c];
+                }
+            }
+            imeRawLatin = compact;
+            NSMutableString *committedOnly = [rawText mutableCopy];
+            [committedOnly deleteCharactersInRange:marked];
+            parseText = committedOnly;
+            parseSel = NSMakeRange(marked.location, 0);
+        } else {
+            return;
+        }
+    }
+
     NSString *query = nil;
-    InputMirrorSkillTrigger trigger = InputMirrorParseSkillTrigger(text, sel, &query);
+    InputMirrorSkillTrigger trigger = InputMirrorParseSkillTrigger(parseText, parseSel, &query);
     if (!trigger.active) {
         self.dismissedSkillTriggerLocation = NSNotFound;
+        self.lastCategoryTriggerChar = 0;
+        self.activeSkillMenuCategoryKey = @"all";
         [self hideSkillMenu];
         return;
     }
@@ -4058,17 +5387,53 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
         return;
     }
 
-    NSArray<InputMirrorSkillItem *> *candidates = (trigger.triggerChar == '@') ? [self mentionsForActiveApp] : [self skillsForActiveApp];
-    NSArray<InputMirrorSkillItem *> *filtered = InputMirrorFilterSkills(candidates, query);
+    if (self.lastCategoryTriggerChar != trigger.triggerChar) {
+        self.lastCategoryTriggerChar = trigger.triggerChar;
+        self.activeSkillMenuCategoryKey = @"all";
+    }
+
+    NSArray<InputMirrorSkillItem *> *candidates = nil;
+    if (trigger.triggerChar == '@') {
+        candidates = [self mentionsForActiveApp];
+    } else if (trigger.triggerChar == '$') {
+        candidates = [self skillsForActiveApp];
+    } else {
+        candidates = [self slashAndSkillCandidatesForActiveApp];
+    }
+
+    self.availableSkillMenuCategories = [self categoriesForCandidates:candidates triggerChar:trigger.triggerChar];
+    if (![self.availableSkillMenuCategories containsObject:(self.activeSkillMenuCategoryKey ?: @"all")]) {
+        self.activeSkillMenuCategoryKey = @"all";
+    }
+
+    NSString *effectiveQuery = query ?: @"";
+    NSArray<InputMirrorSkillItem *> *filtered = nil;
+    if (imeRawLatin.length > 0) {
+        NSString *tryCombined = [effectiveQuery stringByAppendingString:imeRawLatin];
+        NSArray<InputMirrorSkillItem *> *imeFiltered = [self curateItems:candidates
+                                                             forCategory:self.activeSkillMenuCategoryKey
+                                                                   query:tryCombined
+                                                             triggerChar:trigger.triggerChar];
+        if (imeFiltered.count > 0) {
+            filtered = imeFiltered;
+            effectiveQuery = tryCombined;
+        }
+    }
+    if (!filtered) {
+        filtered = [self curateItems:candidates
+                         forCategory:self.activeSkillMenuCategoryKey
+                               query:effectiveQuery
+                         triggerChar:trigger.triggerChar];
+    }
 
     // Avoid popping up on prices or shell variables like "$100" / "$HOME" when no local skills match
-    if (trigger.triggerChar == '$' && filtered.count == 0 && query.length > 0) {
+    if (trigger.triggerChar == '$' && filtered.count == 0 && effectiveQuery.length > 0 && !self.textView.hasMarkedText) {
         [self hideSkillMenu];
         return;
     }
 
     self.activeSkillTrigger = trigger;
-    [self rebuildSkillMenuRowsWithFilteredSkills:filtered query:query triggerChar:trigger.triggerChar];
+    [self rebuildSkillMenuRowsWithFilteredSkills:filtered query:effectiveQuery triggerChar:trigger.triggerChar];
     if (!self.skillMenuPanel.visible) {
         [self.skillMenuPanel orderFrontRegardless];
     }
@@ -4078,7 +5443,23 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     if (!self.skillMenuPanel.visible || !self.skillMenuItems.count) return NO;
     unsigned short keyCode = event.keyCode;
     NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
-    BOOL hasMods = (mods & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl | NSEventModifierFlagShift)) != 0;
+    BOOL hasCmd = (mods & NSEventModifierFlagCommand) != 0;
+    BOOL hasOpt = (mods & NSEventModifierFlagOption) != 0;
+    BOOL hasCtrl = (mods & NSEventModifierFlagControl) != 0;
+    BOOL hasShift = (mods & NSEventModifierFlagShift) != 0;
+    BOOL hasMods = (hasCmd || hasOpt || hasCtrl || hasShift);
+
+    // Category filter tab switching: Shift+Tab, Ctrl+Tab, or Option+Left/Right
+    if (self.availableSkillMenuCategories.count > 1) {
+        if (keyCode == kVK_Tab && (hasShift || hasCtrl) && !hasCmd && !hasOpt) {
+            [self cycleSkillMenuCategoryByDelta:(hasShift && !hasCtrl) ? -1 : 1];
+            return YES;
+        }
+        if ((keyCode == kVK_RightArrow || keyCode == kVK_LeftArrow) && hasOpt && !hasCmd && !hasCtrl && !hasShift) {
+            [self cycleSkillMenuCategoryByDelta:(keyCode == kVK_RightArrow) ? 1 : -1];
+            return YES;
+        }
+    }
 
     if (keyCode == kVK_DownArrow && !hasMods) {
         [self selectSkillMenuRow:self.skillMenuSelectedIndex + 1 scrollToVisible:YES];
@@ -4096,6 +5477,41 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
         self.dismissedSkillTriggerLocation = self.activeSkillTrigger.tokenRange.location;
         [self hideSkillMenu];
         return YES;
+    }
+    return NO;
+}
+
+- (BOOL)handleAtomicChipBackspace {
+    if (self.skillMenuPanel.visible || !self.confirmedChipSet.count) return NO;
+    NSRange sel = self.textView.selectedRange;
+    if (sel.length != 0 || sel.location == 0) return NO;
+    NSString *text = self.textView.string ?: @"";
+    if (sel.location > text.length) return NO;
+
+    NSUInteger caret = sel.location;
+    NSUInteger tokenEnd = caret;
+    if (tokenEnd > 0 && [text characterAtIndex:tokenEnd - 1] == ' ') {
+        tokenEnd--;
+    }
+    if (tokenEnd == 0) return NO;
+
+    NSInteger scan = (NSInteger)tokenEnd - 1;
+    while (scan >= 0 && !IMIsChipTokenTerminator([text characterAtIndex:(NSUInteger)scan])) {
+        unichar ch = [text characterAtIndex:(NSUInteger)scan];
+        if (ch == '@' || ch == '$' || ch == '/') {
+            if (scan == 0 || IMIsNativeChipPrefixBoundary([text characterAtIndex:(NSUInteger)(scan - 1)])) {
+                NSUInteger start = (NSUInteger)scan;
+                NSString *candidate = [text substringWithRange:NSMakeRange(start, tokenEnd - start)];
+                if ([self.confirmedChipSet containsObject:candidate]) {
+                    NSRange deleteRange = NSMakeRange(start, caret - start);
+                    [self.textView applyUndoableReplacementInRange:deleteRange
+                                                        withString:@""
+                                                      newSelection:NSMakeRange(start, 0)];
+                    return YES;
+                }
+            }
+        }
+        scan--;
     }
     return NO;
 }
@@ -4120,21 +5536,36 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
         return;
     }
 
+    // Ensure a clean whitespace boundary before '@', '$', or '/' when preceded by CJK text
+    // so Codex & Antigravity's /(?:^|[\s([{])[@$/]/ parser always activates!
+    BOOL needsLeadingSpace = (tokenRange.location > 0 &&
+                              !IMIsNativeChipPrefixBoundary([currentText characterAtIndex:tokenRange.location - 1]));
+    NSString *lead = needsLeadingSpace ? @" " : @"";
+
     NSString *fallbackPrefix = (self.activeSkillTrigger.triggerChar == '@') ? @"@" : @"/";
     NSString *prefix = item.insertPrefix.length ? item.insertPrefix : fallbackPrefix;
-    unichar trigChar = self.activeSkillTrigger.triggerChar;
+    unichar effectiveTrigChar = prefix.length ? [prefix characterAtIndex:0] : self.activeSkillTrigger.triggerChar;
+
     if (item.requiresNativeHandoff) {
-        NSString *nativeToken = IMNativeMentionQueryToken(item.name);
-        NSString *insertion = [NSString stringWithFormat:@"%@%@", prefix, nativeToken.length ? nativeToken : item.name];
+        NSString *nativeToken = (item.itemKind == InputMirrorItemKindConversation)
+            ? IMNativeMentionQueryToken(item.name)
+            : item.name;
+        NSString *core = [NSString stringWithFormat:@"%@%@", prefix, nativeToken.length ? nativeToken : item.name];
+        NSString *insertion = [lead stringByAppendingString:core];
+        NSUInteger resolvedTrigLoc = tokenRange.location + lead.length;
         [self hideSkillMenu];
         [self.textView applyUndoableReplacementInRange:tokenRange
                                             withString:insertion
                                           newSelection:NSMakeRange(tokenRange.location + insertion.length, 0)];
-        [self handoffToNativeMenuWithTriggerChar:trigChar explicitTriggerLocation:tokenRange.location];
+        [self handoffToNativeMenuWithTriggerChar:effectiveTrigChar
+                         explicitTriggerLocation:resolvedTrigLoc
+                            autoConfirmSelection:item.autoConfirmOnNativeHandoff];
         return;
     }
 
-    NSString *insertion = [NSString stringWithFormat:@"%@%@ ", prefix, item.name];
+    NSString *chipToken = [NSString stringWithFormat:@"%@%@", prefix, item.name];
+    [self.confirmedChipSet addObject:chipToken];
+    NSString *insertion = [NSString stringWithFormat:@"%@%@ ", lead, chipToken];
     [self hideSkillMenu];
     [self.textView applyUndoableReplacementInRange:tokenRange
                                         withString:insertion
@@ -4142,14 +5573,16 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
 }
 
 - (void)handoffToNativeSlashMenu {
-    [self handoffToNativeMenuWithTriggerChar:'/' explicitTriggerLocation:NSNotFound];
+    [self handoffToNativeMenuWithTriggerChar:'/' explicitTriggerLocation:NSNotFound autoConfirmSelection:NO];
 }
 
 - (void)handoffToNativeMentionMenu {
-    [self handoffToNativeMenuWithTriggerChar:'@' explicitTriggerLocation:NSNotFound];
+    [self handoffToNativeMenuWithTriggerChar:'@' explicitTriggerLocation:NSNotFound autoConfirmSelection:NO];
 }
 
-- (void)handoffToNativeMenuWithTriggerChar:(unichar)defaultTriggerChar explicitTriggerLocation:(NSUInteger)explicitTriggerLocation {
+- (void)handoffToNativeMenuWithTriggerChar:(unichar)defaultTriggerChar
+                   explicitTriggerLocation:(NSUInteger)explicitTriggerLocation
+                      autoConfirmSelection:(BOOL)autoConfirmSelection {
     NSString *current = self.textView.string ?: @"";
     NSRange sel = self.textView.selectedRange;
     NSString *handoffText = current;
@@ -4160,7 +5593,17 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
         InputMirrorSkillTrigger trigger = InputMirrorParseSkillTrigger(current, sel, NULL);
         BOOL triggerMatches = trigger.active && (wantsMention ? (trigger.triggerChar == '@') : (trigger.triggerChar == '/' || trigger.triggerChar == '$'));
         if (triggerMatches) {
-            resolvedTrigLoc = trigger.tokenRange.location;
+            if (trigger.tokenRange.location > 0 &&
+                !IMIsNativeChipPrefixBoundary([current characterAtIndex:trigger.tokenRange.location - 1])) {
+                NSMutableString *spaced = [current mutableCopy];
+                [spaced insertString:@" " atIndex:trigger.tokenRange.location];
+                handoffText = spaced;
+                resolvedTrigLoc = trigger.tokenRange.location + 1;
+                [self.textView setString:handoffText];
+                [self.textView setSelectedRange:NSMakeRange(handoffText.length, 0)];
+            } else {
+                resolvedTrigLoc = trigger.tokenRange.location;
+            }
         } else {
             NSString *trigStr = [NSString stringWithFormat:@"%C", defaultTriggerChar];
             if (current.length == 0) {
@@ -4178,6 +5621,7 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
         }
     }
 
+    self.lastNativeHandoffAutoConfirmed = autoConfirmSelection;
     [self hideSkillMenu];
     [self.liveSyncTimer invalidate];
     self.liveSyncTimer = nil;
@@ -4189,7 +5633,7 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     [self clearDismissedElement];
     if (self.targetElement) {
         self.dismissedElement = (AXUIElementRef)CFRetain(self.targetElement);
-        self.dismissedTextSnapshot = handoffText;
+        self.dismissedTextSnapshot = autoConfirmSelection ? @"" : handoffText;
     }
     [self hidePanel];
     self.suppressResignSync = NO;
@@ -4202,7 +5646,53 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
         self.onNativeSlashHandoff(handoffText);
         return;
     }
-    [self flushLocalEditsToTargetAndSend:NO forceKeystrokeEvents:YES triggerLocation:resolvedTrigLoc];
+    [self flushLocalEditsToTargetAndSend:NO
+                    forceKeystrokeEvents:YES
+                         triggerLocation:resolvedTrigLoc
+                    autoConfirmSelection:autoConfirmSelection];
+}
+
+static BOOL IMSegmentsContainNativeChip(NSArray<InputMirrorSyncSegment *> *segments) {
+    for (InputMirrorSyncSegment *seg in segments) {
+        if (seg.isNativeChip) return YES;
+    }
+    return NO;
+}
+
+static void IMReplaySyncSegmentsAtIndex(pid_t pid,
+                                        NSArray<InputMirrorSyncSegment *> *segments,
+                                        NSUInteger index,
+                                        void (^completion)(void)) {
+    if (index >= segments.count) {
+        if (completion) completion();
+        return;
+    }
+    InputMirrorSyncSegment *seg = segments[index];
+    if (!seg.isNativeChip) {
+        if (seg.text.length > 0) {
+            IMSendUnicodeTextToPidEx(pid, seg.text, NO);
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.015 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            IMReplaySyncSegmentsAtIndex(pid, segments, index + 1, completion);
+        });
+        return;
+    }
+
+    // Native chip segment: send real trigger keycode (@ / $ / /) -> wait for native menu -> type query -> Tab to bind real chip!
+    NSString *trigStr = [NSString stringWithFormat:@"%C", seg.triggerChar];
+    IMSendUnicodeTextToPidEx(pid, trigStr, YES);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.045 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (seg.text.length > 0) {
+            IMSendUnicodeTextToPidEx(pid, seg.text, NO);
+        }
+        NSTimeInterval filterWait = (seg.triggerChar == '@') ? 0.085 : 0.055;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(filterWait * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            IMSendKeyToPid(pid, kVK_Tab, 0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.035 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                IMReplaySyncSegmentsAtIndex(pid, segments, index + 1, completion);
+            });
+        });
+    });
 }
 
 - (void)pushLiveEditsToTarget {
@@ -4212,6 +5702,13 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     if ([text isEqualToString:prev]) {
         self.hasLocalEditsPendingSync = NO;
         [self clearDraftForKey:[self currentDraftKey]];
+        return;
+    }
+
+    // Preserve confirmed @ / $ / / chips for structured native keystroke binding on send/dismiss
+    // rather than flattening them into plain AXValue text.
+    if (self.confirmedChipSet.count > 0 &&
+        IMSegmentsContainNativeChip(InputMirrorBuildSyncSegments(text, self.confirmedChipSet))) {
         return;
     }
 
@@ -4272,7 +5769,9 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     self.liveSyncTimer = nil;
     NSString *text = self.textView.string ?: @"";
     AXUIElementRef element = self.targetElement ? (AXUIElementRef)CFRetain(self.targetElement) : NULL;
-    BOOL needsFlush = self.hasLocalEditsPendingSync || ![text isEqualToString:(self.lastSyncedToTargetText ?: @"")];
+    BOOL hasNativeChips = (self.confirmedChipSet.count > 0 &&
+                           IMSegmentsContainNativeChip(InputMirrorBuildSyncSegments(text, self.confirmedChipSet)));
+    BOOL needsFlush = hasNativeChips || self.hasLocalEditsPendingSync || ![text isEqualToString:(self.lastSyncedToTargetText ?: @"")];
     pid_t pid = self.targetPID;
 
     // Clear draft, pending flag & suppress resign sync BEFORE hidePanel so windowDidResignKey NEVER triggers a second sync!
@@ -4291,12 +5790,14 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     self.suppressResignSync = NO;
 
     if (self.onSyncBack) {
+        [self.confirmedChipSet removeAllObjects];
         self.onSyncBack(text, YES);
         return;
     }
 
     if (!needsFlush && pid > 0) {
         self.lastSyncedToTargetText = @"";
+        [self.confirmedChipSet removeAllObjects];
         NSRunningApplication *targetApp = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
         [targetApp activateWithOptions:NSApplicationActivateIgnoringOtherApps];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -4309,15 +5810,23 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
 }
 
 - (void)flushLocalEditsToTargetAndSend:(BOOL)shouldSend {
-    [self flushLocalEditsToTargetAndSend:shouldSend forceKeystrokeEvents:NO triggerLocation:NSNotFound];
+    [self flushLocalEditsToTargetAndSend:shouldSend forceKeystrokeEvents:NO triggerLocation:NSNotFound autoConfirmSelection:NO];
 }
 
-- (void)flushLocalEditsToTargetAndSend:(BOOL)shouldSend forceKeystrokeEvents:(BOOL)forceKeystrokes triggerLocation:(NSUInteger)triggerLocation {
+- (void)flushLocalEditsToTargetAndSend:(BOOL)shouldSend
+                  forceKeystrokeEvents:(BOOL)forceKeystrokes
+                       triggerLocation:(NSUInteger)triggerLocation
+                  autoConfirmSelection:(BOOL)autoConfirmSelection {
     if (self.syncInFlight) return;
     [self.liveSyncTimer invalidate];
     self.liveSyncTimer = nil;
     NSString *text = self.textView.string ?: @"";
     NSString *draftKey = [self currentDraftKey];
+    NSArray<InputMirrorSyncSegment *> *segments = InputMirrorBuildSyncSegments(text, self.confirmedChipSet);
+    BOOL hasNativeChips = IMSegmentsContainNativeChip(segments);
+    if (shouldSend) {
+        [self.confirmedChipSet removeAllObjects];
+    }
     self.hasLocalEditsPendingSync = NO;
 
     AXUIElementRef element = self.targetElement ? (AXUIElementRef)CFRetain(self.targetElement) : NULL;
@@ -4331,8 +5840,8 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
     NSRunningApplication *targetApp = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
     [targetApp activateWithOptions:NSApplicationActivateIgnoringOtherApps];
 
-    // 1. Direct AXValue write + verify (skipped when handing off a native '/' trigger so the app receives real keystrokes)
-    if (!forceKeystrokes) {
+    // 1. Direct AXValue write + verify (skipped when handing off a native trigger or replaying native @/$ chips)
+    if (!forceKeystrokes && !hasNativeChips) {
         AXError err = AXUIElementSetAttributeValue(element, kAXValueAttribute, (__bridge CFStringRef)text);
         BOOL verified = NO;
         if (err == kAXErrorSuccess) {
@@ -4357,12 +5866,10 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
         }
     }
 
-    // 2. Fallback for Electron/Web inputs (ZERO clipboard usage!):
-    // Focus element, clear existing text (Cmd+A + Delete), then inject Unicode text directly via CGEventKeyboardSetUnicodeString!
+    // 2. Fallback & Structured Chip Replayer for Electron/Web inputs (ZERO clipboard usage!):
     AXUIElementSetAttributeValue(element, kAXFocusedAttribute, kCFBooleanTrue);
     CFRelease(element);
 
-    // Scale settle delay with text length so long messages finish arriving in Electron before Return / poll resume
     NSTimeInterval settleDelay = 0.06 + MIN(0.40, (double)text.length * 0.0004);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.09 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -4375,7 +5882,7 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
                         IMSendKeyToPid(pid, kVK_Return, 0);
                         self.lastSyncedToTargetText = @"";
                     } else {
-                        self.lastSyncedToTargetText = text;
+                        self.lastSyncedToTargetText = autoConfirmSelection ? @"" : text;
                     }
                     [self clearDraftForKey:draftKey];
                     self.postSyncGraceUntil = NSProcessInfo.processInfo.systemUptime + 0.30;
@@ -4401,16 +5908,28 @@ static NSString *IMFindProjectRootFromPath(NSString *path) {
                     }
                     IMSendUnicodeTextToPidEx(pid, trigOnly, YES);
                     if (afterTrig.length > 0) {
-                        // Brief pause so Electron/Web editors mount their native @ / slash popover before receiving the query
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.055 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                             IMSendUnicodeTextToPidEx(pid, afterTrig, NO);
-                            finishSend();
+                            if (autoConfirmSelection) {
+                                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.065 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                                    IMSendKeyToPid(pid, kVK_Return, 0);
+                                    finishSend();
+                                });
+                            } else {
+                                finishSend();
+                            }
                         });
                         return;
                     }
                     finishSend();
                     return;
                 }
+            }
+            if (hasNativeChips) {
+                IMReplaySyncSegmentsAtIndex(pid, segments, 0, ^{
+                    finishSend();
+                });
+                return;
             }
             IMSendUnicodeTextToPidEx(pid, text, forceKeystrokes);
             finishSend();

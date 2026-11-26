@@ -4,6 +4,7 @@
 #import <Carbon/Carbon.h>
 #import <sys/file.h>
 #import <unistd.h>
+#import <sqlite3.h>
 #import "Celebration.h"
 #import "PanelTheme.h"
 #import "AntigravityNavigation.h"
@@ -2378,9 +2379,10 @@ int main(int argc, const char *argv[]) {
                 NSArray<InputMirrorSkillItem *> *opencodeMentions = InputMirrorLoadMentionsForApp(@"ai.opencode.desktop", @"OpenCode", tmpWsRoot);
                 NSCAssert(InputMirrorFilterSkills(opencodeMentions, @"explore").count >= 1, @"OpenCode must provide built-in @explore mention");
                 NSArray<InputMirrorSkillItem *> *agMentions = InputMirrorLoadMentionsForApp(@"com.google.antigravity", @"Antigravity", tmpWsRoot);
-                NSCAssert(InputMirrorFilterSkills(agMentions, @"Files").count >= 1 && InputMirrorFilterSkills(agMentions, @"README").count >= 1, @"Antigravity must provide built-in mentions and workspace files");
+                NSCAssert(InputMirrorFilterSkills(agMentions, @"README").count >= 1 && InputMirrorFilterSkills(agMentions, @"terminal").count >= 1, @"Antigravity must provide workspace files and @terminal mention without fake @Files text");
                 NSArray<InputMirrorSkillItem *> *codexMentions = InputMirrorLoadMentionsForApp(@"com.openai.codex", @"Codex", tmpWsRoot);
-                NSCAssert(InputMirrorFilterSkills(codexMentions, @"InputMirror").count >= 1, @"Codex must discover workspace files for @ mention");
+                NSArray<InputMirrorSkillItem *> *codexImHits = InputMirrorFilterSkills(codexMentions, @"im");
+                NSCAssert(codexImHits.count >= 1 && [codexImHits.firstObject.name isEqualToString:@"Sources/InputMirror.m"] && [codexImHits.firstObject.displayTitle isEqualToString:@"InputMirror.m"] && [codexImHits.firstObject.displayDetail isEqualToString:@"Sources/"], @"Codex @ mention must support camelCase acronym 'im' -> InputMirror.m with clean filename + directory detail");
 
                 // Workspace root resolution from Codex global state & VSCode-style storage.json
                 NSString *tmpResolverHome = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"im-ws-resolve-%d", getpid()]];
@@ -2403,6 +2405,22 @@ int main(int argc, const char *argv[]) {
                 NSString *resolvedCursorWs = InputMirrorResolveWorkspaceRootForApp(@"com.todesktop.230313mzl4w4u92", @"Cursor", tmpResolverHome);
                 NSCAssert([resolvedCodexWs isEqualToString:tmpWsRoot], @"Must resolve Codex active workspace root from .codex-global-state.json");
                 NSCAssert([resolvedCursorWs isEqualToString:tmpWsRoot], @"Must resolve Cursor active workspace root from storage.json");
+
+                // Also verify live .codex-global-state.sqlite takes priority over stale .codex-global-state.json
+                NSString *tmpLiveWsRoot = [tmpResolverHome stringByAppendingPathComponent:@"live-codex-ws"];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpLiveWsRoot withIntermediateDirectories:YES attributes:nil error:nil];
+                NSString *sqliteStatePath = [tmpCodexDir stringByAppendingPathComponent:@".codex-global-state.sqlite"];
+                sqlite3 *testStateDB = NULL;
+                if (sqlite3_open(sqliteStatePath.fileSystemRepresentation, &testStateDB) == SQLITE_OK && testStateDB) {
+                    sqlite3_exec(testStateDB, "CREATE TABLE settings (scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (scope, key)) WITHOUT ROWID;", NULL, NULL, NULL);
+                    NSString *selVal = @"{\"type\":\"local\",\"projectId\":\"live-proj\"}";
+                    NSString *lpVal = [NSString stringWithFormat:@"{\"live-proj\":{\"id\":\"live-proj\",\"rootPaths\":[\"%@\"]}}", tmpLiveWsRoot];
+                    NSString *insSql = [NSString stringWithFormat:@"INSERT INTO settings VALUES ('global','electron-owner-value:selected-project:u1','%@'),('global','local-projects','%@');", selVal, lpVal];
+                    sqlite3_exec(testStateDB, insSql.UTF8String, NULL, NULL, NULL);
+                    sqlite3_close(testStateDB);
+                }
+                NSString *resolvedLiveCodexWs = InputMirrorResolveWorkspaceRootForApp(@"com.openai.codex", @"ChatGPT", tmpResolverHome);
+                NSCAssert([resolvedLiveCodexWs isEqualToString:tmpLiveWsRoot], @"Live .codex-global-state.sqlite must override stale .codex-global-state.json");
                 [NSFileManager.defaultManager removeItemAtPath:tmpResolverHome error:nil];
                 [NSFileManager.defaultManager removeItemAtPath:tmpWsRoot error:nil];
 
@@ -2481,6 +2499,98 @@ int main(int argc, const char *argv[]) {
                 controller.inputMirror.overrideMentionsForTesting = nil;
                 controller.inputMirror.overrideWorkspaceRootForTesting = nil;
                 controller.inputMirror.onNativeMentionHandoff = nil;
+
+                // 7d-extra. Deep Codex & Antigravity @ and / parity: official slash commands, ~/.agents/skills, category tabs, CJK auto-space, capsule chips, atomic chip backspace & structured native segment replay
+                NSArray<InputMirrorSkillItem *> *codexSlashCmds = InputMirrorLoadSlashCommandsForApp(@"com.openai.codex", @"Codex");
+                NSCAssert(codexSlashCmds.count >= 20 && [InputMirrorFilterSkills(codexSlashCmds, @"审查").firstObject.name isEqualToString:@"review"] && [InputMirrorFilterSkills(codexSlashCmds, @"压缩").firstObject.name isEqualToString:@"compact"], @"Codex must expose official slash commands with Chinese keyword search");
+                NSArray<InputMirrorSkillItem *> *agSlashCmds = InputMirrorLoadSlashCommandsForApp(@"com.google.antigravity", @"Antigravity");
+                NSCAssert(agSlashCmds.count >= 10 && [InputMirrorFilterSkills(agSlashCmds, @"规划").firstObject.name isEqualToString:@"plan"] && [InputMirrorFilterSkills(agSlashCmds, @"浏览器").firstObject.name isEqualToString:@"browser"], @"Antigravity must expose official slash commands with Chinese keyword search");
+
+                // ~/.agents/skills & workspace .agent/workflows discovery + Chinese display_name (agents/openai.yaml & # H1)
+                NSString *tmpAgentsHome = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"im-agents-home-%d", getpid()]];
+                NSString *tmpProdSkillDir = [tmpAgentsHome stringByAppendingPathComponent:@".agents/skills/prod-rd"];
+                NSString *tmpProdAgentsDir = [tmpProdSkillDir stringByAppendingPathComponent:@"agents"];
+                NSString *tmpTuntasSkillDir = [tmpAgentsHome stringByAppendingPathComponent:@".gemini/config/skills/tuntas-testing"];
+                NSString *tmpAgWfDir = [tmpAgentsHome stringByAppendingPathComponent:@"ws/.agent/workflows"];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpProdAgentsDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpTuntasSkillDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [NSFileManager.defaultManager createDirectoryAtPath:tmpAgWfDir withIntermediateDirectories:YES attributes:nil error:nil];
+                [@"---\nname: prod-rd\ndescription: 生产研发全流程技能\n---\n# 多agent协同\n" writeToFile:[tmpProdSkillDir stringByAppendingPathComponent:@"SKILL.md"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [@"interface:\n  display_name: \"多agent协同\"\n  short_description: \"Antigravity 定方案，Codex 实施\"\n" writeToFile:[tmpProdAgentsDir stringByAppendingPathComponent:@"openai.yaml"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [@"---\nname: tuntas-testing\ndescription: 自动化回归测试\n---\n\n# Tuntas 日常功能回归测试技能\n" writeToFile:[tmpTuntasSkillDir stringByAppendingPathComponent:@"SKILL.md"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                [@"---\ndescription: 发布工作流\n---\n# 线上发布核验\nSteps" writeToFile:[tmpAgWfDir stringByAppendingPathComponent:@"deploy-check.md"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                NSArray<InputMirrorSkillItem *> *codexSharedSkills = InputMirrorLoadSkillsForAppInWorkspace(@"com.openai.codex", @"Codex", nil, tmpAgentsHome);
+                NSCAssert(codexSharedSkills.count == 1 && [codexSharedSkills.firstObject.name isEqualToString:@"prod-rd"] && [codexSharedSkills.firstObject.displayTitle isEqualToString:@"多agent协同"] && [codexSharedSkills.firstObject.displayDetail isEqualToString:@"$prod-rd"] && [codexSharedSkills.firstObject.insertPrefix isEqualToString:@"$"], @"Codex must parse Chinese display_name from agents/openai.yaml alongside $slug");
+                NSCAssert([InputMirrorFilterSkills(codexSharedSkills, @"多agent").firstObject.name isEqualToString:@"prod-rd"] && [InputMirrorFilterSkills(codexSharedSkills, @"协同").firstObject.name isEqualToString:@"prod-rd"], @"Chinese display_name prefix and substring search must rank prod-rd first");
+                NSArray<InputMirrorSkillItem *> *agWfSkills = InputMirrorLoadSkillsForAppInWorkspace(@"com.google.antigravity", @"Antigravity", [tmpAgentsHome stringByAppendingPathComponent:@"ws"], tmpAgentsHome);
+                InputMirrorSkillItem *wfHit = InputMirrorFilterSkills(agWfSkills, @"线上发布").firstObject;
+                InputMirrorSkillItem *tuntasHit = InputMirrorFilterSkills(agWfSkills, @"回归测试").firstObject;
+                NSCAssert(wfHit != nil && [wfHit.name isEqualToString:@"deploy-check"] && [wfHit.displayTitle isEqualToString:@"线上发布核验"] && [wfHit.sourceLabel isEqualToString:@"工作流"], @"Antigravity must extract Chinese # H1 title for workflows");
+                NSCAssert(tuntasHit != nil && [tuntasHit.name isEqualToString:@"tuntas-testing"] && [tuntasHit.displayTitle isEqualToString:@"Tuntas 日常功能回归测试技能"], @"Antigravity must extract Chinese # H1 title for SKILL.md without openai.yaml");
+                [NSFileManager.defaultManager removeItemAtPath:tmpAgentsHome error:nil];
+
+                // Category tabs on Codex '/' (commands + skills), auto-confirmed command handoff vs inline $skill chip
+                controller.inputMirror.overrideSlashCommandsForTesting = codexSlashCmds;
+                controller.inputMirror.overrideSkillsForTesting = codexSharedSkills;
+                __block NSString *slashExecCaptured = nil;
+                controller.inputMirror.onNativeSlashHandoff = ^(NSString *text) {
+                    slashExecCaptured = text;
+                };
+                [controller.inputMirror reconcileExternalFocusText:@"" selection:NSMakeRange(0, 0) bundleID:@"com.openai.codex" appName:@"Codex" pid:42001 appIcon:nil sameTarget:NO];
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"/" selection:NSMakeRange(1, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                NSArray<NSString *> *slashCats = controller.inputMirror.availableSkillMenuCategories;
+                NSCAssert(controller.inputMirror.skillMenuVisible && [slashCats containsObject:@"commands"] && [slashCats containsObject:@"skills"], @"Codex '/' menu must expose commands and skills category tabs");
+                NSEvent *optRight = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagOption timestamp:0 windowNumber:0 context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:124];
+                [controller.inputMirror.textView keyDown:optRight];
+                NSCAssert([controller.inputMirror.activeSkillMenuCategoryKey isEqualToString:@"commands"], @"Option+Right must switch category tab to commands");
+                [controller.inputMirror.textView keyDown:optRight];
+                NSCAssert([controller.inputMirror.activeSkillMenuCategoryKey isEqualToString:@"skills"], @"Second Option+Right must switch category tab to skills");
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"$prod-rd "] && [controller.inputMirror.confirmedChipTokens containsObject:@"$prod-rd"], @"Confirming skill under '/' in Codex must insert $prod-rd chip and keep mirror open");
+
+                // Confirming Codex built-in '/compact' command triggers auto-confirmed native handoff
+                [controller.inputMirror updateMirroredText:@"/compact" selection:NSMakeRange(8, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                [controller.inputMirror.textView keyDown:plainReturn];
+                NSCAssert([slashExecCaptured isEqualToString:@"/compact"] && controller.inputMirror.lastNativeHandoffAutoConfirmed && !controller.inputMirror.visible, @"Selecting Codex /compact command must trigger auto-confirmed native execution");
+                controller.inputMirror.overrideSlashCommandsForTesting = nil;
+                controller.inputMirror.overrideSkillsForTesting = nil;
+                controller.inputMirror.onNativeSlashHandoff = nil;
+
+                // CJK auto-spacing before @chip, capsule chip attributes, atomic chip backspace & multi-chip sync segments
+                InputMirrorSkillItem *mockFileItem = [[InputMirrorSkillItem alloc] init];
+                mockFileItem.name = @"Sources/InputMirror.m";
+                mockFileItem.displayTitle = @"InputMirror.m";
+                mockFileItem.displayDetail = @"Sources/";
+                mockFileItem.insertPrefix = @"@";
+                mockFileItem.sourceLabel = @"文件";
+                mockFileItem.categoryKey = @"files";
+                mockFileItem.itemKind = InputMirrorItemKindFile;
+                controller.inputMirror.overrideMentionsForTesting = @[mockFileItem];
+                [controller.inputMirror showPreviewSample];
+                [controller.inputMirror updateMirroredText:@"请检查@Input" selection:NSMakeRange(9, 0) appName:@"Codex" appIcon:nil];
+                [controller.inputMirror textDidChange:[NSNotification notificationWithName:NSTextDidChangeNotification object:controller.inputMirror.textView]];
+                [controller.inputMirror.textView keyDown:tabKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"请检查 @Sources/InputMirror.m "], @"Tab on CJK-adjacent @Input must auto-insert a space before @Sources/InputMirror.m chip");
+                NSColor *chipAttr = [controller.inputMirror.textView.textStorage attribute:InputMirrorChipColorAttributeName atIndex:5 effectiveRange:NULL];
+                NSCAssert(chipAttr != nil, @"Confirmed @ mention must carry capsule chip border styling");
+
+                // Verify structured sync segments with both $skill and @file chips
+                NSSet<NSString *> *testChipTokens = [NSSet setWithArray:@[@"$prod-rd", @"@Sources/InputMirror.m"]];
+                NSArray<InputMirrorSyncSegment *> *segs = InputMirrorBuildSyncSegments(@"请用 $prod-rd 检查 @Sources/InputMirror.m 的逻辑", testChipTokens);
+                NSCAssert(segs.count == 5 && !segs[0].isNativeChip && [segs[0].text isEqualToString:@"请用 "] &&
+                          segs[1].isNativeChip && segs[1].triggerChar == '$' && [segs[1].text isEqualToString:@"prod-rd"] && segs[1].consumesTrailingSpace &&
+                          !segs[2].isNativeChip && [segs[2].text isEqualToString:@"检查 "] &&
+                          segs[3].isNativeChip && segs[3].triggerChar == '@' && [segs[3].text isEqualToString:@"Sources/InputMirror.m"] && segs[3].consumesTrailingSpace &&
+                          !segs[4].isNativeChip && [segs[4].text isEqualToString:@"的逻辑"],
+                          @"Sync segment builder must split plain text and native @/$ chips while consuming auto-inserted trailing space");
+
+                // Atomic single-Backspace deletion of confirmed @Sources/InputMirror.m chip
+                [controller.inputMirror.textView keyDown:deleteKey];
+                NSCAssert([controller.inputMirror.textView.string isEqualToString:@"请检查 "], @"Single Backspace after confirmed @chip must atomically delete the entire chip");
+                controller.inputMirror.overrideMentionsForTesting = nil;
 
                 // 7e. Draft protection across Space switch, focus loss, multi-app switching & false likelySent prevention
                 controller.inputMirror.onSyncBack = nil;
